@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+#
+# hermes-spawn — spin up a named Hermes Agent instance in Docker, or remove one.
+#
+# Usage:  hermes-spawn <name>
+#         hermes-spawn remove|rm <name> [--keep-data] [-y|--yes]
+# Example: hermes-spawn namely
+#          hermes-spawn remove namely
+#
+# Behavior: ALL preflight checks run first. If anything is already taken
+# or would conflict, the script aborts before touching anything.
+# Only after every check passes does it create the data dir, run setup,
+# start the container, and append the alias.
+#
+
+set -euo pipefail
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+usage_spawn() {
+  echo "Usage: $0 <name>" >&2
+  echo "       $0 remove|rm <name> [--keep-data] [-y|--yes]" >&2
+  echo "Example: $0 namely" >&2
+  echo "         $0 remove namely" >&2
+  exit 1
+}
+
+# Resolve the data directory for a given instance name.
+# Prefers the new location ($HOME/hermes-spawn/<name>); falls back to the
+# legacy location ($HOME/.<name>) so old installs still work for `remove`.
+resolve_data_dir() {
+  local n="$1"
+  local new="$HOME/hermes-spawn/$n"
+  local old="$HOME/.$n"
+  if [[ -e "$new" ]]; then
+    echo "$new"
+  elif [[ -e "$old" ]]; then
+    echo "$old"
+  else
+    echo "$new"   # canonical path for create flow
+  fi
+}
+
+# If a legacy data dir exists at $HOME/.<name> and the new path doesn't,
+# move it. Called during create so existing users don't end up with two
+# data dirs after upgrade.
+migrate_legacy_data_dir() {
+  local n="$1"
+  local new="$HOME/hermes-spawn/$n"
+  local old="$HOME/.$n"
+  if [[ -d "$old" ]] && [[ ! -e "$new" ]]; then
+    echo ">> Found legacy data at $old"
+    echo ">> Migrating to $new"
+    mkdir -p "$HOME/hermes-spawn"
+    mv "$old" "$new"
+  fi
+}
+
+# Remove our comment+alias block (or a stray matching alias line) from ~/.bashrc.
+# Recognizes both legacy alias format (no --user flag) and current format
+# (--user hermes), so `remove` works on instances spawned by older versions.
+strip_hermes_bashrc_for_name() {
+  local n="$1"
+  local f="$2"
+  local comment="# hermes-spawn: alias for '$n' container"
+  local aline_new="alias ${n}='docker exec -it --user hermes ${n} /opt/hermes/.venv/bin/hermes'"
+  local aline_old="alias ${n}='docker exec -it ${n} /opt/hermes/.venv/bin/hermes'"
+  if [[ ! -f "$f" ]]; then
+    return 0
+  fi
+  local lines=() out=() i=0
+  mapfile -t lines < "$f" 2>/dev/null || return 0
+  local m=${#lines[@]}
+  while ((i < m)); do
+    if [[ "${lines[i]}" == "$comment" ]] && ((i + 1 < m)) && { [[ "${lines[i+1]}" == "$aline_new" ]] || [[ "${lines[i+1]}" == "$aline_old" ]]; }; then
+      if ((${#out[@]})) && [[ -z "${out[${#out[@]}-1]//[[:space:]]/}" ]]; then
+        out=("${out[@]:0:$((${#out[@]}-1))}")
+      fi
+      i=$((i+2))
+      continue
+    fi
+    if [[ "${lines[i]}" == "$aline_new" ]] || [[ "${lines[i]}" == "$aline_old" ]]; then
+      i=$((i+1))
+      continue
+    fi
+    out+=("${lines[i]}")
+    i=$((i+1))
+  done
+  { printf '%s\n' "${out[@]}"; } >"${f}.hermes-spawn.$$" 2>/dev/null || { rm -f "${f}.hermes-spawn.$$" 2>/dev/null; return 0; }
+  mv -f "${f}.hermes-spawn.$$" "$f"
+}
+
+# Compute HERMES_UID/HERMES_GID env-var array for docker run, mapping the
+# in-container "hermes" user to the host user so bind-mounted files have
+# correct ownership. Skip if we can't determine a non-root host user.
+compute_hermes_env() {
+  local h_uid="" h_gid=""
+  if [[ "$(id -u)" -ne 0 ]]; then
+    h_uid="$(id -u)"
+    h_gid="$(id -g)"
+  elif [[ -n "${SUDO_UID-}" ]]; then
+    if (( SUDO_UID != 0 )); then
+      h_uid="$SUDO_UID"
+      h_gid="${SUDO_GID:-$(id -g "${SUDO_USER:-}" 2>/dev/null || true)}"
+      [[ -n "$h_gid" ]] || h_gid="$h_uid"
+    fi
+  fi
+  # The image cannot remap "hermes" onto root.
+  if [[ -n "$h_uid" ]] && (( h_uid == 0 )); then
+    h_uid=""; h_gid=""
+  fi
+  if [[ -n "$h_gid" ]] && (( h_gid == 0 )); then
+    h_gid="${h_uid:-}"
+  fi
+  HERMES_UID_RESOLVED="$h_uid"
+  HERMES_GID_RESOLVED="$h_gid"
+}
+
+# =========================================================================
+# Subcommand: remove
+# =========================================================================
+
+sub_remove() {
+  if [[ $# -lt 2 ]]; then
+    echo "Error: $0 remove: missing <name>." >&2
+    usage_spawn
+  fi
+  local n="$2"
+  local keep=0
+  local auto_yes=0
+  shift 2
+  for a; do
+    case "$a" in
+    --keep-data) keep=1 ;;
+    -y | --yes)  auto_yes=1 ;;
+    *) echo "Error: $0 remove: unknown option: $a" >&2; return 1 ;;
+    esac
+  done
+  if ! [[ "$n" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "Error: name must be lowercase letters, numbers, or hyphens (and start with a letter/number)." >&2
+    return 1
+  fi
+
+  local DATA_DIR
+  DATA_DIR="$(resolve_data_dir "$n")"
+  local BASHRC="$HOME/.bashrc"
+  local cmt="# hermes-spawn: alias for '$n' container"
+  local aline_new="alias ${n}='docker exec -it --user hermes ${n} /opt/hermes/.venv/bin/hermes'"
+  local aline_old="alias ${n}='docker exec -it ${n} /opt/hermes/.venv/bin/hermes'"
+
+  local has_dock=0 has_d=0 has_b=0
+  if command -v docker &>/dev/null && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$n"; then
+    has_dock=1
+  fi
+  if [[ -e "$DATA_DIR" ]]; then has_d=1; fi
+  if [[ -f "$BASHRC" ]]; then
+    if grep -qF "$cmt" "$BASHRC" 2>/dev/null \
+       || grep -qFx "$aline_new" "$BASHRC" 2>/dev/null \
+       || grep -qFx "$aline_old" "$BASHRC" 2>/dev/null; then
+      has_b=1
+    fi
+  fi
+
+  if ! ((has_dock || has_d || has_b)); then
+    echo "Error: no instance '$n' to remove." >&2
+    echo "       (no container, no data at $HOME/hermes-spawn/$n or $HOME/.$n, no hermes-spawn block in $BASHRC)" >&2
+    return 1
+  fi
+
+  if ((has_d)) && ((!keep)) && [[ -d "$DATA_DIR" ]] && [[ -n $(ls -A "$DATA_DIR" 2>/dev/null) ]] && ((!auto_yes)) && ! [[ -t 0 ]]; then
+    echo "Error: non-interactive: pass -y to delete data, or use --keep-data" >&2
+    return 1
+  fi
+
+  if ((has_dock)); then
+    echo ">> Removing container '$n'..."
+    docker rm -f "$n" >/dev/null
+  fi
+
+  if ((has_b)); then
+    echo ">> Cleaning hermes-spawn lines in $BASHRC..."
+    strip_hermes_bashrc_for_name "$n" "$BASHRC"
+  fi
+
+  if ((has_d)) && ((!keep)); then
+    if ! [[ -d "$DATA_DIR" ]]; then
+      :
+    elif [[ -n "$(ls -A "$DATA_DIR" 2>/dev/null)" ]]; then
+      if ((auto_yes)); then
+        echo ">> Removing $DATA_DIR ..."
+        rm -rf -- "$DATA_DIR"
+      elif [[ -t 0 ]]; then
+        read -r -p "Delete $DATA_DIR (all instance data)? [y/N] " ans
+        if [[ "$ans" =~ ^[yY] ]]; then
+          echo ">> Removing $DATA_DIR ..."
+          rm -rf -- "$DATA_DIR"
+        else
+          echo ">> Data kept at $DATA_DIR"
+        fi
+      fi
+    else
+      rmdir -- "$DATA_DIR" 2>/dev/null || rm -rf -- "$DATA_DIR" 2>/dev/null
+    fi
+  elif ((has_d)) && ((keep)); then
+    echo ">> Data left in $DATA_DIR (--keep-data)"
+  fi
+
+  if ((has_b)); then
+    echo ">> Done. Run  source $BASHRC  if you want this shell to forget the '$n' alias."
+  else
+    echo ">> Done."
+  fi
+  return 0
+}
+
+# =========================================================================
+# Subcommand routing
+# =========================================================================
+
+if [[ ${1-} == remove || ${1-} == rm ]]; then
+  if [[ $# -lt 2 ]]; then
+    echo "Error: $0 remove: missing <name>." >&2
+    usage_spawn
+  fi
+  sub_remove "$@"
+  exit $?
+fi
+
+# =========================================================================
+# Subcommand: create (default)
+# =========================================================================
+
+if [[ $# -ne 1 ]]; then
+  usage_spawn
+fi
+
+NAME="$1"
+DATA_DIR="$HOME/hermes-spawn/$NAME"
+IMAGE="nousresearch/hermes-agent"
+BASHRC="$HOME/.bashrc"
+# Run docker exec as the hermes user (UID 10000 inside the container), not
+# root. If we run as root, any files the user creates via this alias (e.g.
+# from `<name> gateway setup`) end up owned by root, then the gateway can't
+# write to them after dropping privileges → crash loop.
+ALIAS_CMD="docker exec -it --user hermes ${NAME} /opt/hermes/.venv/bin/hermes"
+ALIAS_LINE="alias ${NAME}='${ALIAS_CMD}'"
+
+# Resolve UID/GID mapping for the container's hermes user.
+compute_hermes_env
+DOCKER_HERMES_ENV=()
+if [[ -n "$HERMES_UID_RESOLVED" ]]; then
+  DOCKER_HERMES_ENV=(
+    -e "HERMES_UID=$HERMES_UID_RESOLVED"
+    -e "HERMES_GID=${HERMES_GID_RESOLVED:-$HERMES_UID_RESOLVED}"
+  )
+fi
+
+# =========================================================================
+# 2. PREFLIGHT CHECKS — nothing is created or modified until ALL pass
+# =========================================================================
+
+# --- 2a. name format -----------------------------------------------------
+if ! [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+  echo "Error: name must be lowercase letters, numbers, or hyphens (and start with a letter/number)." >&2
+  exit 1
+fi
+
+# --- 2b. reserved names ---------------------------------------------------
+RESERVED_NAMES=(
+  remove rm
+  ls cd cp mv mkdir rmdir cat grep sed awk find sudo su
+  bash sh zsh fish docker apt yum dnf systemctl service
+  git python python3 node npm pip curl wget ssh scp
+  test echo printf which type alias unalias source export
+  kill killall ps top htop nano vim emacs
+  hermes-spawn
+)
+for r in "${RESERVED_NAMES[@]}"; do
+  if [[ "$NAME" == "$r" ]]; then
+    echo "Error: '$NAME' is a reserved name (would shadow a system command)." >&2
+    echo "       Pick something else, e.g. ${NAME}-bot or my-${NAME}." >&2
+    exit 1
+  fi
+done
+
+# --- 2c. docker available -------------------------------------------------
+if ! command -v docker &>/dev/null; then
+  echo "Error: docker is not installed or not in PATH." >&2
+  exit 1
+fi
+
+# --- 2d. container name not taken ----------------------------------------
+if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
+  echo "Error: a Docker container named '$NAME' already exists. Nothing was changed." >&2
+  echo "       Inspect:  docker ps -a --filter name=^${NAME}\$" >&2
+  echo "       Remove:   $0 remove $NAME" >&2
+  exit 1
+fi
+
+# --- 2e. data directory not in use ---------------------------------------
+# Check both new and legacy locations. Legacy will be auto-migrated below
+# (only if container/alias don't exist), so empty/missing is fine here.
+LEGACY_DIR="$HOME/.$NAME"
+for d in "$DATA_DIR" "$LEGACY_DIR"; do
+  if [[ -e "$d" ]] && [[ -n "$(ls -A "$d" 2>/dev/null)" ]]; then
+    echo "Error: $d already exists and is not empty. Nothing was changed." >&2
+    echo "       A previous '$NAME' instance probably left data behind." >&2
+    echo "       Options:" >&2
+    echo "         - Pick a different name." >&2
+    echo "         - Back it up:  mv $d ${d}.bak" >&2
+    echo "         - Wipe it:     rm -rf $d" >&2
+    echo "         - Or clean up: $0 remove $NAME" >&2
+    exit 1
+  fi
+done
+
+# --- 2f. alias name not already in ~/.bashrc -----------------------------
+if grep -qE "^[[:space:]]*alias[[:space:]]+${NAME}=" "$BASHRC" 2>/dev/null; then
+  echo "Error: an alias named '$NAME' already exists in $BASHRC. Nothing was changed." >&2
+  echo "       Remove it manually first, or run:  $0 remove $NAME" >&2
+  exit 1
+fi
+
+# --- 2g. name not already a real binary on PATH --------------------------
+if command -v "$NAME" &>/dev/null; then
+  REAL_PATH="$(command -v "$NAME")"
+  echo "Error: '$NAME' already exists on PATH at $REAL_PATH. Nothing was changed." >&2
+  echo "       The alias would shadow it. Pick a different name." >&2
+  exit 1
+fi
+
+# --- 2h. find a free host port (start at 8642) ---------------------------
+find_free_port() {
+  local port=8642
+  while ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; do
+    port=$((port + 1))
+  done
+  echo "$port"
+}
+PORT="$(find_free_port)"
+
+# =========================================================================
+# 3. ALL CHECKS PASSED — now actually do things
+# =========================================================================
+
+echo ">> All checks passed. Setting up '$NAME'..."
+echo "   Data dir : $DATA_DIR"
+echo "   Port     : 127.0.0.1:$PORT  (host -> container 8642)"
+if [[ -n "$HERMES_UID_RESOLVED" ]]; then
+  echo "   UID/GID  : $HERMES_UID_RESOLVED:${HERMES_GID_RESOLVED:-$HERMES_UID_RESOLVED} (mapped)"
+else
+  echo "   UID/GID  : default (running as root; using world-writable data dir)"
+fi
+echo
+
+# --- 3a. data dir: migrate from legacy if present, else create -----------
+migrate_legacy_data_dir "$NAME"
+mkdir -p "$DATA_DIR"
+
+# Set permissions. With HERMES_UID mapping the container user to the host
+# user, the bind mount works correctly with restrictive perms (700/755).
+# Without that mapping, we fall back to 777 so the dropped-privileges user
+# inside the container can still write.
+if [[ -n "$HERMES_UID_RESOLVED" ]]; then
+  chmod 700 "$DATA_DIR"
+else
+  chmod -R 777 "$DATA_DIR"
+fi
+
+# --- 3b. interactive setup wizard ----------------------------------------
+echo
+echo "================================================================"
+echo " IMPORTANT: Use a UNIQUE bot token for this instance."
+echo " Don't reuse Telegram/Discord/WhatsApp/Slack tokens across"
+echo " instances — Hermes will refuse to start the gateway if two"
+echo " instances try to share the same bot token."
+echo "================================================================"
+echo
+docker run -it --rm \
+  "${DOCKER_HERMES_ENV[@]}" \
+  -v "$DATA_DIR:/opt/data" \
+  "$IMAGE" setup
+
+# --- 3b-post. fix ownership on anything the wizard left as root ----------
+# The Hermes image's entrypoint chowns most of /opt/data to the hermes user
+# (UID 10000), but some platform-specific dirs (notably whatsapp/, and
+# .env) get created later as root and aren't fixed up. The gateway then
+# drops privileges to UID 10000 and can't write to those files. We fix it
+# here in a throwaway root-mode container.
+echo
+echo ">> Fixing ownership on data dir (workaround for Hermes image issue)..."
+docker run --rm \
+  --user 0:0 \
+  --entrypoint chown \
+  -v "$DATA_DIR:/opt/data" \
+  "$IMAGE" -R 10000:10000 /opt/data
+
+# --- 3c. start gateway ---------------------------------------------------
+echo
+echo ">> Starting gateway container '$NAME' on 127.0.0.1:$PORT..."
+docker run -d \
+  --name "$NAME" \
+  --restart unless-stopped \
+  "${DOCKER_HERMES_ENV[@]}" \
+  -v "$DATA_DIR:/opt/data" \
+  -p "127.0.0.1:${PORT}:8642" \
+  "$IMAGE" gateway run > /dev/null
+
+# --- 3d. append alias ----------------------------------------------------
+{
+  echo ""
+  echo "# hermes-spawn: alias for '$NAME' container"
+  echo "$ALIAS_LINE"
+} >> "$BASHRC"
+echo ">> Alias added to $BASHRC"
+
+# =========================================================================
+# 4. DONE
+# =========================================================================
+cat <<EOF
+
+✓ '$NAME' is running.
+
+  Container : $NAME
+  Data dir  : $DATA_DIR
+  Port      : 127.0.0.1:$PORT
+
+Activate the alias in this shell:
+
+  source ~/.bashrc
+
+Then:
+  $NAME              # open interactive chat
+  $NAME --help
+
+Docker commands:
+  docker logs -f $NAME    # tail gateway logs
+  docker stop $NAME       # stop the gateway
+  docker start $NAME      # start it again
+  $0 remove $NAME         # stop container, remove data + alias
+
+EOF
+
+exit 0
