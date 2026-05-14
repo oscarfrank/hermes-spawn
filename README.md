@@ -8,7 +8,7 @@ Spin up named [Hermes Agent](https://hermes-agent.nousresearch.com) instances in
 curl -fsSL https://raw.githubusercontent.com/oscarfrank/hermes-spawn/main/install.sh | bash
 ```
 
-## Updating
+## Updating hermes-spawn
 
 `install.sh` always downloads the current `hermes-spawn` from the `main` branch and overwrites `/usr/local/bin/hermes-spawn` if it is already there. So after you push a new version:
 
@@ -82,6 +82,17 @@ If any conflict is detected, the script aborts cleanly without changing anything
 
 ## Managing instances
 
+**Update an instance to the latest Hermes image (pull + recreate container, data unchanged):**
+
+```bash
+hermes-spawn update <name>
+hermes-spawn update hermes              # example
+hermes-spawn update hermes --no-pull    # recreate from local image only
+hermes-spawn update hermes --image nousresearch/hermes-agent:<tag>
+```
+
+By default, `update` runs `docker pull nousresearch/hermes-agent` (the `latest` tag), stops and removes the existing container, then starts a new one with the same data directory, host port, and `HERMES_UID` / `HERMES_GID` settings. Your `~/.bashrc` alias is unchanged. Expect a short gateway outage during the swap.
+
 **Remove an instance (container, `~/.bashrc` block, and data):**
 
 ```bash
@@ -131,7 +142,7 @@ sudo rm /usr/local/bin/hermes-spawn
 
 ## How it works
 
-`hermes-spawn` is a thin bash script around a few Docker commands, plus a `remove` / `rm` subcommand. On the host, each instance's files live in `~/hermes-spawn/<name>` and are bind-mounted to `/opt/data` in the container. To create an instance, it:
+`hermes-spawn` is a thin bash script around a few Docker commands, plus `update` and `remove` / `rm` subcommands. On the host, each instance's files live in `~/hermes-spawn/<name>` and are bind-mounted to `/opt/data` in the container. To create an instance, it:
 
 1. Validates inputs and detects conflicts
 2. Calls `docker run ... setup` interactively for the wizard
@@ -139,6 +150,8 @@ sudo rm /usr/local/bin/hermes-spawn
 4. Appends `alias <name>='docker exec -it <name> /opt/hermes/.venv/bin/hermes'` to `~/.bashrc`
 
 `hermes-spawn remove <name>` does the reverse: `docker rm -f`, prunes the alias block, and (unless `--keep-data`) removes `~/hermes-spawn/<name>` after a prompt or ` -y` / `--yes` in non-interactive environments.
+
+`hermes-spawn update <name>` pulls a new image (by default `nousresearch/hermes-agent`), reads the existing container's port mapping, data mount, and env vars, recreates the gateway container, and leaves data and aliases in place.
 
 Read the script — it's plain bash with no dependencies beyond Docker and standard Unix tools. <https://github.com/oscarfrank/hermes-spawn/blob/main/hermes-spawn>
 
