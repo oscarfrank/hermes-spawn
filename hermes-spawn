@@ -3,9 +3,11 @@
 # hermes-spawn — spin up a named Hermes Agent instance in Docker, or remove one.
 #
 # Usage:  hermes-spawn <name>
+#         hermes-spawn dashboard <name> [--disable] [--no-tui]
 #         hermes-spawn update <name> [--image <ref>] [--no-pull]
 #         hermes-spawn remove|rm <name> [--keep-data] [-y|--yes]
 # Example: hermes-spawn namely
+#          hermes-spawn dashboard namely
 #          hermes-spawn update namely
 #          hermes-spawn remove namely
 #
@@ -25,9 +27,11 @@ HERMES_IMAGE="nousresearch/hermes-agent"
 
 usage_spawn() {
   echo "Usage: $0 <name>" >&2
+  echo "       $0 dashboard <name> [--disable] [--no-tui]" >&2
   echo "       $0 update <name> [--image <ref>] [--no-pull]" >&2
   echo "       $0 remove|rm <name> [--keep-data] [-y|--yes]" >&2
   echo "Example: $0 namely" >&2
+  echo "         $0 dashboard namely" >&2
   echo "         $0 update namely" >&2
   echo "         $0 remove namely" >&2
   exit 1
@@ -122,6 +126,126 @@ compute_hermes_env() {
   fi
   HERMES_UID_RESOLVED="$h_uid"
   HERMES_GID_RESOLVED="$h_gid"
+}
+
+# Return 0 when a Hermes-style env value means "enabled".
+env_truthy() {
+  case "$1" in
+  1 | true | TRUE | yes | YES | on | ON) return 0 ;;
+  esac
+  return 1
+}
+
+# Find the lowest free TCP port on the host, starting at $1 (default 8642).
+find_free_host_port() {
+  local port="${1:-8642}"
+  while ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; do
+    port=$((port + 1))
+  done
+  echo "$port"
+}
+
+# Populated by load_gateway_instance / used by recreate_gateway_instance.
+INSTANCE_DATA_MOUNT=""
+INSTANCE_GW_HOST_IP=""
+INSTANCE_GW_HOST_PORT=""
+INSTANCE_DASH_ENABLED=0
+INSTANCE_DASH_TUI=0
+INSTANCE_DASH_HOST_IP=""
+INSTANCE_DASH_HOST_PORT=""
+INSTANCE_DOCKER_ENV=()
+
+# Read gateway container settings needed to recreate it (ports, data, dashboard, UID/GID).
+load_gateway_instance() {
+  local n="$1"
+  local port_line dash_port_line env_line val
+
+  port_line="$(docker port "$n" 8642/tcp 2>/dev/null | head -n1 || true)"
+  if [[ -z "$port_line" ]]; then
+    echo "Error: container '$n' has no published port for container 8642/tcp." >&2
+    echo "       This does not look like a hermes-spawn gateway container." >&2
+    return 1
+  fi
+  INSTANCE_GW_HOST_IP="${port_line%:*}"
+  INSTANCE_GW_HOST_PORT="${port_line##*:}"
+
+  INSTANCE_DATA_MOUNT="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/opt/data"}}{{.Source}}{{end}}{{end}}' "$n" 2>/dev/null || true)"
+  if [[ -z "$INSTANCE_DATA_MOUNT" ]]; then
+    echo "Error: container '$n' has no bind mount at /opt/data." >&2
+    return 1
+  fi
+  if [[ ! -d "$INSTANCE_DATA_MOUNT" ]]; then
+    echo "Error: data directory '$INSTANCE_DATA_MOUNT' from container mount is missing on the host." >&2
+    return 1
+  fi
+
+  INSTANCE_DASH_ENABLED=0
+  INSTANCE_DASH_TUI=0
+  INSTANCE_DASH_HOST_IP=""
+  INSTANCE_DASH_HOST_PORT=""
+  INSTANCE_DOCKER_ENV=()
+
+  dash_port_line="$(docker port "$n" 9119/tcp 2>/dev/null | head -n1 || true)"
+  if [[ -n "$dash_port_line" ]]; then
+    INSTANCE_DASH_HOST_IP="${dash_port_line%:*}"
+    INSTANCE_DASH_HOST_PORT="${dash_port_line##*:}"
+    INSTANCE_DASH_ENABLED=1
+  fi
+
+  while IFS= read -r env_line; do
+    case "$env_line" in
+    HERMES_UID=* | HERMES_GID=*)
+      INSTANCE_DOCKER_ENV+=(-e "$env_line")
+      ;;
+    HERMES_DASHBOARD=*)
+      val="${env_line#HERMES_DASHBOARD=}"
+      if env_truthy "$val"; then
+        INSTANCE_DASH_ENABLED=1
+      fi
+      ;;
+    HERMES_DASHBOARD_TUI=*)
+      val="${env_line#HERMES_DASHBOARD_TUI=}"
+      if env_truthy "$val"; then
+        INSTANCE_DASH_TUI=1
+      fi
+      ;;
+    esac
+  done < <(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$n" 2>/dev/null || true)
+
+  return 0
+}
+
+# Recreate a gateway container; preserves dashboard settings when dash_enabled=1.
+recreate_gateway_instance() {
+  local n="$1" image="$2"
+  local dash_enabled="${3:-0}" dash_tui="${4:-0}"
+  local dash_host_ip="${5:-}" dash_host_port="${6:-}"
+  local run_args=()
+
+  run_args=(
+    -d
+    --name "$n"
+    --restart unless-stopped
+  )
+  if ((${#INSTANCE_DOCKER_ENV[@]})); then
+    run_args+=("${INSTANCE_DOCKER_ENV[@]}")
+  fi
+  if ((dash_enabled)); then
+    run_args+=(-e HERMES_DASHBOARD=1)
+    if ((dash_tui)); then
+      run_args+=(-e HERMES_DASHBOARD_TUI=1)
+    fi
+  fi
+  run_args+=(
+    -v "$INSTANCE_DATA_MOUNT:/opt/data"
+    -p "${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}:8642"
+  )
+  if ((dash_enabled)) && [[ -n "$dash_host_ip" ]] && [[ -n "$dash_host_port" ]]; then
+    run_args+=(-p "${dash_host_ip}:${dash_host_port}:9119")
+  fi
+
+  docker rm -f "$n" >/dev/null
+  docker run "${run_args[@]}" "$image" gateway run >/dev/null
 }
 
 # =========================================================================
@@ -269,43 +393,29 @@ sub_update() {
     return 1
   fi
 
-  local port_line data_mount host_ip host_port
-  port_line="$(docker port "$n" 8642/tcp 2>/dev/null | head -n1 || true)"
-  if [[ -z "$port_line" ]]; then
-    echo "Error: container '$n' has no published port for container 8642/tcp." >&2
-    echo "       This does not look like a hermes-spawn gateway container." >&2
-    return 1
-  fi
-  host_ip="${port_line%:*}"
-  host_port="${port_line##*:}"
-
-  data_mount="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/opt/data"}}{{.Source}}{{end}}{{end}}' "$n" 2>/dev/null || true)"
-  if [[ -z "$data_mount" ]]; then
-    echo "Error: container '$n' has no bind mount at /opt/data." >&2
-    return 1
-  fi
-  if [[ ! -d "$data_mount" ]]; then
-    echo "Error: data directory '$data_mount' from container mount is missing on the host." >&2
+  if ! load_gateway_instance "$n"; then
     return 1
   fi
 
-  local expected_dir
+  local expected_dir dash_host_ip dash_host_port
   expected_dir="$(resolve_data_dir "$n")"
-  if [[ "$data_mount" != "$expected_dir" ]] && [[ -e "$expected_dir" ]]; then
-    echo ">> Note: container data mount is $data_mount (expected $expected_dir); keeping mount as-is."
+  if [[ "$INSTANCE_DATA_MOUNT" != "$expected_dir" ]] && [[ -e "$expected_dir" ]]; then
+    echo ">> Note: container data mount is $INSTANCE_DATA_MOUNT (expected $expected_dir); keeping mount as-is."
   fi
 
-  local docker_env=() env_line
-  while IFS= read -r env_line; do
-    case "$env_line" in
-    HERMES_UID=* | HERMES_GID=*) docker_env+=(-e "$env_line") ;;
-    esac
-  done < <(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$n")
+  dash_host_ip="$INSTANCE_DASH_HOST_IP"
+  dash_host_port="$INSTANCE_DASH_HOST_PORT"
 
   echo ">> Updating '$n'..."
   echo "   Image    : $image"
-  echo "   Data dir : $data_mount"
-  echo "   Port     : ${host_ip}:${host_port}  (host -> container 8642)"
+  echo "   Data dir : $INSTANCE_DATA_MOUNT"
+  echo "   Gateway  : ${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}  (host -> container 8642)"
+  if ((INSTANCE_DASH_ENABLED)); then
+    echo "   Dashboard: ${dash_host_ip}:${dash_host_port}  (host -> container 9119)"
+    if ((INSTANCE_DASH_TUI)); then
+      echo "   Chat tab : enabled"
+    fi
+  fi
   echo
 
   if ((do_pull)); then
@@ -316,14 +426,7 @@ sub_update() {
   fi
 
   echo ">> Recreating container '$n'..."
-  docker rm -f "$n" >/dev/null
-  docker run -d \
-    --name "$n" \
-    --restart unless-stopped \
-    "${docker_env[@]}" \
-    -v "$data_mount:/opt/data" \
-    -p "${host_ip}:${host_port}:8642" \
-    "$image" gateway run >/dev/null
+  recreate_gateway_instance "$n" "$image" "$INSTANCE_DASH_ENABLED" "$INSTANCE_DASH_TUI" "$dash_host_ip" "$dash_host_port"
 
   cat <<EOF
 
@@ -331,8 +434,15 @@ sub_update() {
 
   Container : $n
   Image     : $image
-  Data dir  : $data_mount
-  Port      : ${host_ip}:${host_port}
+  Data dir  : $INSTANCE_DATA_MOUNT
+  Gateway   : ${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}
+EOF
+  if ((INSTANCE_DASH_ENABLED)); then
+    cat <<EOF
+  Dashboard : http://${dash_host_ip}:${dash_host_port}
+EOF
+  fi
+  cat <<EOF
 
 Docker commands:
   docker logs -f $n    # tail gateway logs
@@ -343,8 +453,161 @@ EOF
 }
 
 # =========================================================================
+# Subcommand: dashboard
+# =========================================================================
+
+sub_dashboard() {
+  if [[ $# -lt 2 ]]; then
+    echo "Error: $0 dashboard: missing <name>." >&2
+    usage_spawn
+  fi
+  local n="$2"
+  local disable=0
+  local no_tui=0
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --disable) disable=1 ;;
+    --no-tui)  no_tui=1 ;;
+    *)
+      echo "Error: $0 dashboard: unknown option: $1" >&2
+      return 1
+      ;;
+    esac
+    shift
+  done
+
+  if ((disable)) && ((no_tui)); then
+    echo "Error: $0 dashboard: --disable and --no-tui cannot be used together." >&2
+    return 1
+  fi
+
+  if ! [[ "$n" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "Error: name must be lowercase letters, numbers, or hyphens (and start with a letter/number)." >&2
+    return 1
+  fi
+  if ! command -v docker &>/dev/null; then
+    echo "Error: docker is not installed or not in PATH." >&2
+    return 1
+  fi
+  if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$n"; then
+    echo "Error: no Docker container named '$n'." >&2
+    echo "       Spawn one first:  $0 $n" >&2
+    return 1
+  fi
+
+  if ! load_gateway_instance "$n"; then
+    return 1
+  fi
+
+  local dash_enabled="$INSTANCE_DASH_ENABLED"
+  local dash_tui="$INSTANCE_DASH_TUI"
+  local dash_host_ip="$INSTANCE_DASH_HOST_IP"
+  local dash_host_port="$INSTANCE_DASH_HOST_PORT"
+
+  if ((disable)); then
+    if ! ((INSTANCE_DASH_ENABLED)); then
+      echo ">> Dashboard is not enabled on '$n'. Nothing to do."
+      return 0
+    fi
+    dash_enabled=0
+    dash_tui=0
+    dash_host_ip=""
+    dash_host_port=""
+  else
+    dash_enabled=1
+    if ((no_tui)); then
+      dash_tui=0
+    else
+      dash_tui=1
+    fi
+    if [[ -n "$dash_host_ip" ]] && [[ -n "$dash_host_port" ]]; then
+      :
+    else
+      dash_host_ip="127.0.0.1"
+      dash_host_port="$(find_free_host_port 9119)"
+    fi
+    if ((INSTANCE_DASH_ENABLED)) && ((INSTANCE_DASH_TUI == dash_tui)); then
+      echo ">> Dashboard already enabled on '$n'."
+      echo "   Gateway   : ${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}"
+      echo "   Dashboard : http://${dash_host_ip}:${dash_host_port}"
+      if ((dash_tui)); then
+        echo "   Chat tab  : enabled"
+      else
+        echo "   Chat tab  : disabled (use without --no-tui to enable)"
+      fi
+      return 0
+    fi
+  fi
+
+  if ((disable)); then
+    echo ">> Disabling dashboard on '$n'..."
+  else
+    echo ">> Enabling dashboard on '$n'..."
+  fi
+  echo "   Data dir : $INSTANCE_DATA_MOUNT"
+  echo "   Gateway  : ${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}  (host -> container 8642)"
+  if ((dash_enabled)); then
+    echo "   Dashboard: ${dash_host_ip}:${dash_host_port}  (host -> container 9119)"
+    if ((dash_tui)); then
+      echo "   Chat tab : enabled (HERMES_DASHBOARD_TUI=1)"
+    else
+      echo "   Chat tab : disabled"
+    fi
+  fi
+  echo
+
+  echo ">> Recreating container '$n'..."
+  recreate_gateway_instance "$n" "$HERMES_IMAGE" "$dash_enabled" "$dash_tui" "$dash_host_ip" "$dash_host_port"
+
+  if ((dash_enabled)); then
+    cat <<EOF
+
+✓ Dashboard enabled on '$n'.
+
+  Container : $n
+  Data dir  : $INSTANCE_DATA_MOUNT
+  Gateway   : ${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}
+  Dashboard : http://${dash_host_ip}:${dash_host_port}
+EOF
+    if ((dash_tui)); then
+      echo "  Chat tab  : open the Dashboard URL and use the Chat tab in your browser"
+    fi
+    cat <<EOF
+
+Docker commands:
+  docker logs -f $n              # gateway + [dashboard] logs
+  $0 dashboard $n --disable      # turn dashboard off
+  $0 update $n                   # pull latest image (keeps dashboard settings)
+
+EOF
+  else
+    cat <<EOF
+
+✓ Dashboard disabled on '$n'.
+
+  Container : $n
+  Gateway   : ${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}
+
+  $0 dashboard $n                # enable again
+
+EOF
+  fi
+  return 0
+}
+
+# =========================================================================
 # Subcommand routing
 # =========================================================================
+
+if [[ ${1-} == dashboard ]]; then
+  if [[ $# -lt 2 ]]; then
+    echo "Error: $0 dashboard: missing <name>." >&2
+    usage_spawn
+  fi
+  sub_dashboard "$@"
+  exit $?
+fi
 
 if [[ ${1-} == update ]]; then
   if [[ $# -lt 2 ]]; then
@@ -404,7 +667,7 @@ fi
 
 # --- 2b. reserved names ---------------------------------------------------
 RESERVED_NAMES=(
-  remove rm update
+  remove rm update dashboard
   ls cd cp mv mkdir rmdir cat grep sed awk find sudo su
   bash sh zsh fish docker apt yum dnf systemctl service
   git python python3 node npm pip curl wget ssh scp
@@ -467,14 +730,7 @@ if command -v "$NAME" &>/dev/null; then
 fi
 
 # --- 2h. find a free host port (start at 8642) ---------------------------
-find_free_port() {
-  local port=8642
-  while ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; do
-    port=$((port + 1))
-  done
-  echo "$port"
-}
-PORT="$(find_free_port)"
+PORT="$(find_free_host_port 8642)"
 
 # =========================================================================
 # 3. ALL CHECKS PASSED — now actually do things
@@ -574,6 +830,7 @@ Docker commands:
   docker logs -f $NAME    # tail gateway logs
   docker stop $NAME       # stop the gateway
   docker start $NAME      # start it again
+  $0 dashboard $NAME      # enable web dashboard + browser chat tab
   $0 update $NAME         # pull latest image and recreate container
   $0 remove $NAME         # stop container, remove data + alias
 

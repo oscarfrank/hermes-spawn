@@ -2,6 +2,13 @@
 
 Spin up named [Hermes Agent](https://hermes-agent.nousresearch.com) instances in Docker with a single command. Each instance gets its own data directory, its own gateway, and its own shell command.
 
+```bash
+hermes-spawn <name>                 # create a new instance
+hermes-spawn dashboard <name>       # enable web dashboard (+ browser Chat tab)
+hermes-spawn update <name>          # pull latest image and recreate container
+hermes-spawn remove <name>          # tear down instance (container, alias, data)
+```
+
 ## Install
 
 ```bash
@@ -48,6 +55,14 @@ source ~/.bashrc
 
 Example: `hermes` — drops you into chat. Use `/exit` or Ctrl+D to leave.
 
+**4. (Optional) Enable the web dashboard:**
+
+```bash
+hermes-spawn dashboard <name>
+```
+
+Example: `hermes-spawn dashboard hermes` — opens a browser UI at `http://127.0.0.1:<port>` (dashboard port starts at 9119). The Chat tab is on by default. See [Managing instances](#managing-instances) for `--no-tui`, `--disable`, and remote access.
+
 That's it.
 
 ## Multiple instances
@@ -63,7 +78,7 @@ source ~/.bashrc          # one source picks up all new aliases
 
 Then `assistant`, `support`, and `research` are all separate commands.
 
-Ports are auto-assigned starting at 8642, bound to `127.0.0.1` only.
+Ports are auto-assigned starting at 8642 (gateway) and 9119 (dashboard, when enabled), bound to `127.0.0.1` only.
 
 ## Prerequisites
 
@@ -75,10 +90,10 @@ Ports are auto-assigned starting at 8642, bound to `127.0.0.1` only.
 
 - Lowercase letters, numbers, and hyphens only
 - Must start with a letter or number
-- Cannot match a reserved system command (`ls`, `docker`, `git`, etc.)
+- Cannot match a reserved name — including `hermes-spawn` subcommands (`dashboard`, `update`, `remove`, `rm`) and common system commands (`ls`, `docker`, `git`, etc.)
 - Cannot collide with an existing Docker container, data directory, alias, or binary on PATH
 
-If any conflict is detected, the script aborts cleanly without changing anything.
+If any conflict is detected, the script aborts cleanly without changing anything. You cannot spawn an instance named `dashboard` — `hermes-spawn dashboard` is always the dashboard subcommand (it expects an existing instance name as the next argument, e.g. `hermes-spawn dashboard hermes`). The same applies to `update`, `remove`, and `rm`.
 
 ## Managing instances
 
@@ -91,7 +106,26 @@ hermes-spawn update hermes --no-pull    # recreate from local image only
 hermes-spawn update hermes --image nousresearch/hermes-agent:<tag>
 ```
 
-By default, `update` runs `docker pull nousresearch/hermes-agent` (the `latest` tag), stops and removes the existing container, then starts a new one with the same data directory, host port, and `HERMES_UID` / `HERMES_GID` settings. Your `~/.bashrc` alias is unchanged. Expect a short gateway outage during the swap.
+By default, `update` runs `docker pull nousresearch/hermes-agent` (the `latest` tag), stops and removes the existing container, then starts a new one with the same data directory, host port, dashboard settings (if enabled), and `HERMES_UID` / `HERMES_GID` settings. Your `~/.bashrc` alias is unchanged. Expect a short gateway outage during the swap.
+
+**Enable the web dashboard (official Hermes side-process in the same container):**
+
+```bash
+hermes-spawn dashboard <name>
+hermes-spawn dashboard hermes              # example — dashboard + browser Chat tab
+hermes-spawn dashboard hermes --no-tui   # dashboard without the Chat tab
+hermes-spawn dashboard hermes --disable  # turn dashboard off again
+```
+
+This recreates the existing gateway container with `HERMES_DASHBOARD=1` and `HERMES_DASHBOARD_TUI=1` (Chat tab on by default), publishes a localhost dashboard port starting at 9119, and leaves your data and shell alias unchanged. Open `http://127.0.0.1:<port>` in a browser.
+
+On a remote server, tunnel the dashboard port first:
+
+```bash
+ssh -L 9119:127.0.0.1:9119 user@your-server
+```
+
+Then open `http://127.0.0.1:9119` locally. `hermes-spawn update <name>` preserves dashboard settings.
 
 **Remove an instance (container, `~/.bashrc` block, and data):**
 
@@ -105,9 +139,11 @@ hermes-spawn rm <name> -y   # same as `remove` but delete data without asking
 
 ```bash
 docker ps                    # list running instances
-docker logs -f <name>        # tail an instance's logs
+docker logs -f <name>        # tail gateway (+ [dashboard]) logs
 docker stop <name>           # stop the gateway
 docker start <name>          # start it again
+hermes-spawn dashboard <name>   # enable web dashboard
+hermes-spawn update <name>      # pull latest Hermes image
 ```
 
 You can still `docker rm -f <name>` to drop only the container (data under `~/hermes-spawn/<name>` and the shell alias in `~/.bashrc` stay — use `hermes-spawn remove` for a full cleanup).
@@ -124,6 +160,7 @@ sudo chmod +x /usr/local/bin/hermes-spawn
 ## Security notes
 
 - **Gateway ports are bound to `127.0.0.1` by default.** They are not reachable from the internet. To access remotely, use SSH tunneling, Tailscale, or a reverse proxy with authentication. The Hermes gateway has no built-in auth.
+- **The web dashboard has no authentication** and can read/write API keys in `.env`. Dashboard ports are also bound to `127.0.0.1` by default — treat `hermes-spawn dashboard` like exposing your credentials locally.
 - **Do not reuse bot tokens** across instances. Hermes has built-in token locks that will refuse to start a second gateway with the same token, but it's cleaner to use unique tokens from the start.
 - **API key budget alerts.** Customer-facing instances can rack up costs fast if abused. Set spending limits in your provider's dashboard.
 - **The data directory is `chmod 777`** to work around Docker UID/GID mismatches. On a single-user VPS this is fine; on shared hosts, restrict access to the parent directory.
@@ -142,7 +179,7 @@ sudo rm /usr/local/bin/hermes-spawn
 
 ## How it works
 
-`hermes-spawn` is a thin bash script around a few Docker commands, plus `update` and `remove` / `rm` subcommands. On the host, each instance's files live in `~/hermes-spawn/<name>` and are bind-mounted to `/opt/data` in the container. To create an instance, it:
+`hermes-spawn` is a thin bash script around a few Docker commands, plus `dashboard`, `update`, and `remove` / `rm` subcommands. On the host, each instance's files live in `~/hermes-spawn/<name>` and are bind-mounted to `/opt/data` in the container. To create an instance, it:
 
 1. Validates inputs and detects conflicts
 2. Calls `docker run ... setup` interactively for the wizard
@@ -151,7 +188,9 @@ sudo rm /usr/local/bin/hermes-spawn
 
 `hermes-spawn remove <name>` does the reverse: `docker rm -f`, prunes the alias block, and (unless `--keep-data`) removes `~/hermes-spawn/<name>` after a prompt or ` -y` / `--yes` in non-interactive environments.
 
-`hermes-spawn update <name>` pulls a new image (by default `nousresearch/hermes-agent`), reads the existing container's port mapping, data mount, and env vars, recreates the gateway container, and leaves data and aliases in place.
+`hermes-spawn update <name>` pulls a new image (by default `nousresearch/hermes-agent`), reads the existing container's port mapping, data mount, dashboard settings, and env vars, recreates the gateway container, and leaves data and aliases in place.
+
+`hermes-spawn dashboard <name>` enables or disables Hermes's built-in web dashboard as a side-process in the same container (`HERMES_DASHBOARD=1`, optional `HERMES_DASHBOARD_TUI=1` for the browser Chat tab), following the [official Docker pattern](https://hermes-agent.nousresearch.com/docs/user-guide/docker#running-the-dashboard).
 
 Read the script — it's plain bash with no dependencies beyond Docker and standard Unix tools. <https://github.com/oscarfrank/hermes-spawn/blob/main/hermes-spawn>
 
