@@ -4,7 +4,7 @@
 #
 # Usage:  hermes-spawn <name>
 #         hermes-spawn restore <name>
-#         hermes-spawn dashboard <name> [--disable] [--no-tui]
+#         hermes-spawn dashboard <name> [--disable] [--no-tui] [--oauth]
 #         hermes-spawn update <name> [--image <ref>] [--no-pull]
 #         hermes-spawn remove|rm <name> [--keep-data] [-y|--yes]
 # Example: hermes-spawn namely
@@ -30,7 +30,7 @@ HERMES_IMAGE="nousresearch/hermes-agent"
 usage_spawn() {
   echo "Usage: $0 <name>" >&2
   echo "       $0 restore <name>" >&2
-  echo "       $0 dashboard <name> [--disable] [--no-tui]" >&2
+  echo "       $0 dashboard <name> [--disable] [--no-tui] [--oauth]" >&2
   echo "       $0 update <name> [--image <ref>] [--no-pull]" >&2
   echo "       $0 remove|rm <name> [--keep-data] [-y|--yes]" >&2
   echo "Example: $0 namely" >&2
@@ -187,6 +187,7 @@ INSTANCE_GW_HOST_IP=""
 INSTANCE_GW_HOST_PORT=""
 INSTANCE_DASH_ENABLED=0
 INSTANCE_DASH_TUI=0
+INSTANCE_DASH_INSECURE=0
 INSTANCE_DASH_HOST_IP=""
 INSTANCE_DASH_HOST_PORT=""
 INSTANCE_DOCKER_ENV=()
@@ -217,6 +218,7 @@ load_gateway_instance() {
 
   INSTANCE_DASH_ENABLED=0
   INSTANCE_DASH_TUI=0
+  INSTANCE_DASH_INSECURE=0
   INSTANCE_DASH_HOST_IP=""
   INSTANCE_DASH_HOST_PORT=""
   INSTANCE_DOCKER_ENV=()
@@ -227,6 +229,9 @@ load_gateway_instance() {
     INSTANCE_DASH_HOST_PORT="${dash_port_line##*:}"
     INSTANCE_DASH_ENABLED=1
   fi
+
+  local oauth_label="" insecure_env_val="" has_insecure_env=0
+  oauth_label="$(docker inspect --format '{{index .Config.Labels "hermes-spawn.dashboard.oauth"}}' "$n" 2>/dev/null || true)"
 
   while IFS= read -r env_line; do
     case "$env_line" in
@@ -245,8 +250,21 @@ load_gateway_instance() {
         INSTANCE_DASH_TUI=1
       fi
       ;;
+    HERMES_DASHBOARD_INSECURE=*)
+      has_insecure_env=1
+      insecure_env_val="${env_line#HERMES_DASHBOARD_INSECURE=}"
+      ;;
     esac
   done < <(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$n" 2>/dev/null || true)
+
+  if [[ "$oauth_label" == "1" ]]; then
+    INSTANCE_DASH_INSECURE=0
+  elif ((has_insecure_env)) && env_truthy "$insecure_env_val"; then
+    INSTANCE_DASH_INSECURE=1
+  elif ((INSTANCE_DASH_ENABLED)); then
+    # Default for hermes-spawn dashboards (including legacy containers without the env var).
+    INSTANCE_DASH_INSECURE=1
+  fi
 
   return 0
 }
@@ -256,6 +274,7 @@ start_gateway_instance() {
   local n="$1" image="$2"
   local dash_enabled="${3:-0}" dash_tui="${4:-0}"
   local dash_host_ip="${5:-}" dash_host_port="${6:-}"
+  local dash_insecure="${7:-0}"
   local run_args=()
 
   run_args=(
@@ -270,6 +289,12 @@ start_gateway_instance() {
     run_args+=(-e HERMES_DASHBOARD=1)
     if ((dash_tui)); then
       run_args+=(-e HERMES_DASHBOARD_TUI=1)
+    fi
+    if ((dash_insecure)); then
+      run_args+=(-e HERMES_DASHBOARD_INSECURE=1)
+      run_args+=(--label hermes-spawn.dashboard.oauth=0)
+    else
+      run_args+=(--label hermes-spawn.dashboard.oauth=1)
     fi
   fi
   run_args+=(
@@ -463,6 +488,11 @@ sub_update() {
     if ((INSTANCE_DASH_TUI)); then
       echo "   Chat tab : enabled"
     fi
+    if ((INSTANCE_DASH_INSECURE)); then
+      echo "   Dashboard auth: localhost / reverse-proxy (HERMES_DASHBOARD_INSECURE=1)"
+    else
+      echo "   Dashboard auth: Hermes OAuth gate"
+    fi
   fi
   echo
 
@@ -474,7 +504,7 @@ sub_update() {
   fi
 
   echo ">> Recreating container '$n'..."
-  recreate_gateway_instance "$n" "$image" "$INSTANCE_DASH_ENABLED" "$INSTANCE_DASH_TUI" "$dash_host_ip" "$dash_host_port"
+  recreate_gateway_instance "$n" "$image" "$INSTANCE_DASH_ENABLED" "$INSTANCE_DASH_TUI" "$dash_host_ip" "$dash_host_port" "$INSTANCE_DASH_INSECURE"
 
   cat <<EOF
 
@@ -512,11 +542,13 @@ sub_dashboard() {
   local n="$2"
   local disable=0
   local no_tui=0
+  local oauth=0
   shift 2
   while [[ $# -gt 0 ]]; do
     case "$1" in
     --disable) disable=1 ;;
     --no-tui)  no_tui=1 ;;
+    --oauth)   oauth=1 ;;
     *)
       echo "Error: $0 dashboard: unknown option: $1" >&2
       return 1
@@ -525,8 +557,8 @@ sub_dashboard() {
     shift
   done
 
-  if ((disable)) && ((no_tui)); then
-    echo "Error: $0 dashboard: --disable and --no-tui cannot be used together." >&2
+  if ((disable)) && { ((no_tui)) || ((oauth)); }; then
+    echo "Error: $0 dashboard: --disable cannot be combined with --no-tui or --oauth." >&2
     return 1
   fi
 
@@ -556,6 +588,7 @@ sub_dashboard() {
 
   local dash_enabled="$INSTANCE_DASH_ENABLED"
   local dash_tui="$INSTANCE_DASH_TUI"
+  local dash_insecure="$INSTANCE_DASH_INSECURE"
   local dash_host_ip="$INSTANCE_DASH_HOST_IP"
   local dash_host_port="$INSTANCE_DASH_HOST_PORT"
 
@@ -566,6 +599,7 @@ sub_dashboard() {
     fi
     dash_enabled=0
     dash_tui=0
+    dash_insecure=0
     dash_host_ip=""
     dash_host_port=""
   else
@@ -575,13 +609,20 @@ sub_dashboard() {
     else
       dash_tui=1
     fi
+    if ((oauth)); then
+      dash_insecure=0
+    else
+      dash_insecure=1
+    fi
     if [[ -n "$dash_host_ip" ]] && [[ -n "$dash_host_port" ]]; then
       :
     else
       dash_host_ip="127.0.0.1"
       dash_host_port="$(find_free_host_port 9119)"
     fi
-    if ((INSTANCE_DASH_ENABLED)) && ((INSTANCE_DASH_TUI == dash_tui)); then
+    if ((INSTANCE_DASH_ENABLED)) \
+       && ((INSTANCE_DASH_TUI == dash_tui)) \
+       && ((INSTANCE_DASH_INSECURE == dash_insecure)); then
       echo ">> Dashboard already enabled on '$n'."
       echo "   Gateway   : ${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}"
       echo "   Dashboard : http://${dash_host_ip}:${dash_host_port}"
@@ -589,6 +630,11 @@ sub_dashboard() {
         echo "   Chat tab  : enabled"
       else
         echo "   Chat tab  : disabled (use without --no-tui to enable)"
+      fi
+      if ((dash_insecure)); then
+        echo "   Auth      : localhost / reverse-proxy (HERMES_DASHBOARD_INSECURE=1)"
+      else
+        echo "   Auth      : Hermes OAuth gate"
       fi
       return 0
     fi
@@ -608,11 +654,16 @@ sub_dashboard() {
     else
       echo "   Chat tab : disabled"
     fi
+    if ((dash_insecure)); then
+      echo "   Auth     : localhost / reverse-proxy (HERMES_DASHBOARD_INSECURE=1)"
+    else
+      echo "   Auth     : Hermes OAuth gate (--oauth)"
+    fi
   fi
   echo
 
   echo ">> Recreating container '$n'..."
-  recreate_gateway_instance "$n" "$HERMES_IMAGE" "$dash_enabled" "$dash_tui" "$dash_host_ip" "$dash_host_port"
+  recreate_gateway_instance "$n" "$HERMES_IMAGE" "$dash_enabled" "$dash_tui" "$dash_host_ip" "$dash_host_port" "$dash_insecure"
 
   if ((dash_enabled)); then
     cat <<EOF
@@ -626,6 +677,11 @@ sub_dashboard() {
 EOF
     if ((dash_tui)); then
       echo "  Chat tab  : open the Dashboard URL and use the Chat tab in your browser"
+    fi
+    if ((dash_insecure)); then
+      echo "  Auth      : no Hermes OAuth gate (use your own proxy auth if exposing beyond localhost)"
+    else
+      echo "  Auth      : Hermes OAuth gate (set HERMES_DASHBOARD_OAUTH_CLIENT_ID if required)"
     fi
     cat <<EOF
 
