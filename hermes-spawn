@@ -3,10 +3,12 @@
 # hermes-spawn — spin up a named Hermes Agent instance in Docker, or remove one.
 #
 # Usage:  hermes-spawn <name>
+#         hermes-spawn restore <name>
 #         hermes-spawn dashboard <name> [--disable] [--no-tui]
 #         hermes-spawn update <name> [--image <ref>] [--no-pull]
 #         hermes-spawn remove|rm <name> [--keep-data] [-y|--yes]
 # Example: hermes-spawn namely
+#          hermes-spawn restore namely
 #          hermes-spawn dashboard namely
 #          hermes-spawn update namely
 #          hermes-spawn remove namely
@@ -27,10 +29,12 @@ HERMES_IMAGE="nousresearch/hermes-agent"
 
 usage_spawn() {
   echo "Usage: $0 <name>" >&2
+  echo "       $0 restore <name>" >&2
   echo "       $0 dashboard <name> [--disable] [--no-tui]" >&2
   echo "       $0 update <name> [--image <ref>] [--no-pull]" >&2
   echo "       $0 remove|rm <name> [--keep-data] [-y|--yes]" >&2
   echo "Example: $0 namely" >&2
+  echo "         $0 restore namely" >&2
   echo "         $0 dashboard namely" >&2
   echo "         $0 update namely" >&2
   echo "         $0 remove namely" >&2
@@ -100,6 +104,38 @@ strip_hermes_bashrc_for_name() {
   done
   { printf '%s\n' "${out[@]}"; } >"${f}.hermes-spawn.$$" 2>/dev/null || { rm -f "${f}.hermes-spawn.$$" 2>/dev/null; return 0; }
   mv -f "${f}.hermes-spawn.$$" "$f"
+}
+
+# Return 0 if ~/.bashrc already has our alias block for $n.
+bashrc_has_hermes_spawn_alias() {
+  local n="$1"
+  local f="${2:-$HOME/.bashrc}"
+  local comment="# hermes-spawn: alias for '$n' container"
+  local aline_new="alias ${n}='docker exec -it --user hermes ${n} /opt/hermes/.venv/bin/hermes'"
+  local aline_old="alias ${n}='docker exec -it ${n} /opt/hermes/.venv/bin/hermes'"
+  [[ -f "$f" ]] || return 1
+  grep -qF "$comment" "$f" 2>/dev/null && return 0
+  grep -qFx "$aline_new" "$f" 2>/dev/null && return 0
+  grep -qFx "$aline_old" "$f" 2>/dev/null && return 0
+  return 1
+}
+
+# Return 0 if $dir looks like an existing Hermes data volume.
+hermes_data_dir_looks_valid() {
+  local d="$1"
+  [[ -f "$d/.env" || -f "$d/config.yaml" ]]
+}
+
+# Fix ownership on bind-mounted data (Hermes image workaround).
+fix_hermes_data_ownership() {
+  local data_dir="$1"
+  local image="${2:-$HERMES_IMAGE}"
+  echo ">> Fixing ownership on data dir (workaround for Hermes image issue)..."
+  docker run --rm \
+    --user 0:0 \
+    --entrypoint chown \
+    -v "$data_dir:/opt/data" \
+    "$image" -R 10000:10000 /opt/data
 }
 
 # Compute HERMES_UID/HERMES_GID env-var array for docker run, mapping the
@@ -215,8 +251,8 @@ load_gateway_instance() {
   return 0
 }
 
-# Recreate a gateway container; preserves dashboard settings when dash_enabled=1.
-recreate_gateway_instance() {
+# Start a gateway container (container must not already exist).
+start_gateway_instance() {
   local n="$1" image="$2"
   local dash_enabled="${3:-0}" dash_tui="${4:-0}"
   local dash_host_ip="${5:-}" dash_host_port="${6:-}"
@@ -244,8 +280,14 @@ recreate_gateway_instance() {
     run_args+=(-p "${dash_host_ip}:${dash_host_port}:9119")
   fi
 
-  docker rm -f "$n" >/dev/null
   docker run "${run_args[@]}" "$image" gateway run >/dev/null
+}
+
+# Recreate a gateway container; preserves dashboard settings when dash_enabled=1.
+recreate_gateway_instance() {
+  local n="$1"
+  docker rm -f "$n" >/dev/null
+  start_gateway_instance "$@"
 }
 
 # =========================================================================
@@ -389,7 +431,13 @@ sub_update() {
   fi
   if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$n"; then
     echo "Error: no Docker container named '$n' to update." >&2
-    echo "       Spawn one first:  $0 $n" >&2
+    local data_dir
+    data_dir="$(resolve_data_dir "$n")"
+    if [[ -d "$data_dir" ]] && [[ -n "$(ls -A "$data_dir" 2>/dev/null)" ]] && hermes_data_dir_looks_valid "$data_dir"; then
+      echo "       Found existing data at $data_dir — restore instead:  $0 restore $n" >&2
+    else
+      echo "       Spawn one first:  $0 $n" >&2
+    fi
     return 1
   fi
 
@@ -492,7 +540,13 @@ sub_dashboard() {
   fi
   if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$n"; then
     echo "Error: no Docker container named '$n'." >&2
-    echo "       Spawn one first:  $0 $n" >&2
+    local data_dir
+    data_dir="$(resolve_data_dir "$n")"
+    if [[ -d "$data_dir" ]] && [[ -n "$(ls -A "$data_dir" 2>/dev/null)" ]] && hermes_data_dir_looks_valid "$data_dir"; then
+      echo "       Found existing data at $data_dir — restore instead:  $0 restore $n" >&2
+    else
+      echo "       Spawn one first:  $0 $n" >&2
+    fi
     return 1
   fi
 
@@ -597,8 +651,136 @@ EOF
 }
 
 # =========================================================================
+# Subcommand: restore
+# =========================================================================
+
+sub_restore() {
+  if [[ $# -ne 2 ]]; then
+    echo "Error: $0 restore: expected exactly one <name>." >&2
+    usage_spawn
+  fi
+  local n="$2"
+  local BASHRC="$HOME/.bashrc"
+  local ALIAS_CMD="docker exec -it --user hermes ${n} /opt/hermes/.venv/bin/hermes"
+  local ALIAS_LINE="alias ${n}='${ALIAS_CMD}'"
+
+  if ! [[ "$n" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "Error: name must be lowercase letters, numbers, or hyphens (and start with a letter/number)." >&2
+    return 1
+  fi
+  if ! command -v docker &>/dev/null; then
+    echo "Error: docker is not installed or not in PATH." >&2
+    return 1
+  fi
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$n"; then
+    echo "Error: a Docker container named '$n' already exists." >&2
+    echo "       Use  $0 update $n  to refresh the image, or  $0 remove $n  to tear it down." >&2
+    return 1
+  fi
+
+  migrate_legacy_data_dir "$n"
+  local DATA_DIR
+  DATA_DIR="$(resolve_data_dir "$n")"
+  if [[ ! -d "$DATA_DIR" ]] || [[ -z "$(ls -A "$DATA_DIR" 2>/dev/null)" ]]; then
+    echo "Error: no existing data to restore for '$n'." >&2
+    echo "       Expected a non-empty directory at $HOME/hermes-spawn/$n (or legacy $HOME/.$n)." >&2
+    echo "       Create a new instance instead:  $0 $n" >&2
+    return 1
+  fi
+  if ! hermes_data_dir_looks_valid "$DATA_DIR"; then
+    echo "Error: $DATA_DIR does not look like Hermes data (missing .env and config.yaml)." >&2
+    echo "       Back it up if needed, then spawn fresh:  $0 $n" >&2
+    return 1
+  fi
+
+  if command -v "$n" &>/dev/null; then
+    local REAL_PATH
+    REAL_PATH="$(command -v "$n")"
+    echo "Error: '$n' already exists on PATH at $REAL_PATH. Nothing was changed." >&2
+    echo "       Pick a different name or remove the conflicting binary." >&2
+    return 1
+  fi
+
+  if grep -qE "^[[:space:]]*alias[[:space:]]+${n}=" "$BASHRC" 2>/dev/null \
+     && ! bashrc_has_hermes_spawn_alias "$n" "$BASHRC"; then
+    echo "Error: an unrelated alias named '$n' already exists in $BASHRC. Nothing was changed." >&2
+    echo "       Remove it manually first." >&2
+    return 1
+  fi
+
+  compute_hermes_env
+  INSTANCE_DOCKER_ENV=()
+  if [[ -n "$HERMES_UID_RESOLVED" ]]; then
+    INSTANCE_DOCKER_ENV=(
+      -e "HERMES_UID=$HERMES_UID_RESOLVED"
+      -e "HERMES_GID=${HERMES_GID_RESOLVED:-$HERMES_UID_RESOLVED}"
+    )
+  fi
+  INSTANCE_DATA_MOUNT="$DATA_DIR"
+  INSTANCE_GW_HOST_IP="127.0.0.1"
+  INSTANCE_GW_HOST_PORT="$(find_free_host_port 8642)"
+
+  echo ">> Restoring '$n' from existing data..."
+  echo "   Data dir : $DATA_DIR"
+  echo "   Port     : ${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}  (host -> container 8642)"
+  if [[ -n "$HERMES_UID_RESOLVED" ]]; then
+    echo "   UID/GID  : $HERMES_UID_RESOLVED:${HERMES_GID_RESOLVED:-$HERMES_UID_RESOLVED} (mapped)"
+  fi
+  echo "   Setup    : skipped (using existing config)"
+  echo
+
+  fix_hermes_data_ownership "$DATA_DIR" "$HERMES_IMAGE"
+
+  echo ">> Starting gateway container '$n'..."
+  start_gateway_instance "$n" "$HERMES_IMAGE" 0 0 "" ""
+
+  if bashrc_has_hermes_spawn_alias "$n" "$BASHRC"; then
+    echo ">> Alias already present in $BASHRC"
+  else
+    {
+      echo ""
+      echo "# hermes-spawn: alias for '$n' container"
+      echo "$ALIAS_LINE"
+    } >> "$BASHRC"
+    echo ">> Alias added to $BASHRC"
+  fi
+
+  cat <<EOF
+
+✓ '$n' restored and running.
+
+  Container : $n
+  Data dir  : $DATA_DIR
+  Gateway   : ${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}
+
+Activate the alias in this shell (if newly added):
+
+  source ~/.bashrc
+
+Then:
+  $n              # open interactive chat
+
+Docker commands:
+  docker logs -f $n       # tail gateway logs
+  $0 dashboard $n         # enable web dashboard (not preserved across restore)
+  $0 update $n            # pull latest image and recreate container
+
+EOF
+  return 0
+}
+
+# =========================================================================
 # Subcommand routing
 # =========================================================================
+
+if [[ ${1-} == restore ]]; then
+  if [[ $# -lt 2 ]]; then
+    echo "Error: $0 restore: missing <name>." >&2
+    usage_spawn
+  fi
+  sub_restore "$@"
+  exit $?
+fi
 
 if [[ ${1-} == dashboard ]]; then
   if [[ $# -lt 2 ]]; then
@@ -667,7 +849,7 @@ fi
 
 # --- 2b. reserved names ---------------------------------------------------
 RESERVED_NAMES=(
-  remove rm update dashboard
+  remove rm update restore dashboard
   ls cd cp mv mkdir rmdir cat grep sed awk find sudo su
   bash sh zsh fish docker apt yum dnf systemctl service
   git python python3 node npm pip curl wget ssh scp
@@ -706,10 +888,10 @@ for d in "$DATA_DIR" "$LEGACY_DIR"; do
     echo "Error: $d already exists and is not empty. Nothing was changed." >&2
     echo "       A previous '$NAME' instance probably left data behind." >&2
     echo "       Options:" >&2
+    echo "         - Restore it:  $0 restore $NAME" >&2
     echo "         - Pick a different name." >&2
     echo "         - Back it up:  mv $d ${d}.bak" >&2
     echo "         - Wipe it:     rm -rf $d" >&2
-    echo "         - Or clean up: $0 remove $NAME" >&2
     exit 1
   fi
 done
@@ -781,12 +963,7 @@ docker run -it --rm \
 # drops privileges to UID 10000 and can't write to those files. We fix it
 # here in a throwaway root-mode container.
 echo
-echo ">> Fixing ownership on data dir (workaround for Hermes image issue)..."
-docker run --rm \
-  --user 0:0 \
-  --entrypoint chown \
-  -v "$DATA_DIR:/opt/data" \
-  "$HERMES_IMAGE" -R 10000:10000 /opt/data
+fix_hermes_data_ownership "$DATA_DIR" "$HERMES_IMAGE"
 
 # --- 3c. start gateway ---------------------------------------------------
 echo
@@ -830,6 +1007,7 @@ Docker commands:
   docker logs -f $NAME    # tail gateway logs
   docker stop $NAME       # stop the gateway
   docker start $NAME      # start it again
+  $0 restore $NAME        # recreate container from existing data (no setup)
   $0 dashboard $NAME      # enable web dashboard + browser chat tab
   $0 update $NAME         # pull latest image and recreate container
   $0 remove $NAME         # stop container, remove data + alias

@@ -4,6 +4,7 @@ Spin up named [Hermes Agent](https://hermes-agent.nousresearch.com) instances in
 
 ```bash
 hermes-spawn <name>                 # create a new instance
+hermes-spawn restore <name>         # recreate container from existing data
 hermes-spawn dashboard <name>       # enable web dashboard (+ browser Chat tab)
 hermes-spawn update <name>          # pull latest image and recreate container
 hermes-spawn remove <name>          # tear down instance (container, alias, data)
@@ -90,12 +91,23 @@ Ports are auto-assigned starting at 8642 (gateway) and 9119 (dashboard, when ena
 
 - Lowercase letters, numbers, and hyphens only
 - Must start with a letter or number
-- Cannot match a reserved name — including `hermes-spawn` subcommands (`dashboard`, `update`, `remove`, `rm`) and common system commands (`ls`, `docker`, `git`, etc.)
+- Cannot match a reserved name — including `hermes-spawn` subcommands (`restore`, `dashboard`, `update`, `remove`, `rm`) and common system commands (`ls`, `docker`, `git`, etc.)
 - Cannot collide with an existing Docker container, data directory, alias, or binary on PATH
 
-If any conflict is detected, the script aborts cleanly without changing anything. You cannot spawn an instance named `dashboard` — `hermes-spawn dashboard` is always the dashboard subcommand (it expects an existing instance name as the next argument, e.g. `hermes-spawn dashboard hermes`). The same applies to `update`, `remove`, and `rm`.
+If any conflict is detected, the script aborts cleanly without changing anything. You cannot spawn an instance named `dashboard` or `restore` — those words are subcommands (e.g. `hermes-spawn restore hermes`). The same applies to `update`, `remove`, and `rm`.
 
 ## Managing instances
+
+**Restore a container from leftover data (container gone, data still on disk):**
+
+```bash
+hermes-spawn restore <name>
+hermes-spawn restore hermes    # example
+```
+
+Use this when the Docker container (and maybe the shell alias) were removed but `~/hermes-spawn/<name>` still has your config, sessions, and keys. Restore skips the setup wizard, reattaches a new gateway container to the existing data directory, picks a free gateway port, and re-adds the `~/.bashrc` alias if it is missing. Run `hermes-spawn dashboard <name>` afterward if you had the web UI enabled before — dashboard settings are not stored on disk.
+
+Pairs with `hermes-spawn remove <name> --keep-data`, which drops the container and alias but leaves data behind.
 
 **Update an instance to the latest Hermes image (pull + recreate container, data unchanged):**
 
@@ -132,6 +144,7 @@ Then open `http://127.0.0.1:9119` locally. `hermes-spawn update <name>` preserve
 ```bash
 hermes-spawn remove <name>   # interactive prompt if data is non-empty; use -y in scripts/CI
 hermes-spawn remove <name> --keep-data   # drop the container and alias, keep ~/hermes-spawn/<name>
+hermes-spawn restore <name>              # bring the container back from kept data
 hermes-spawn rm <name> -y   # same as `remove` but delete data without asking
 ```
 
@@ -146,7 +159,7 @@ hermes-spawn dashboard <name>   # enable web dashboard
 hermes-spawn update <name>      # pull latest Hermes image
 ```
 
-You can still `docker rm -f <name>` to drop only the container (data under `~/hermes-spawn/<name>` and the shell alias in `~/.bashrc` stay — use `hermes-spawn remove` for a full cleanup).
+You can still `docker rm -f <name>` to drop only the container (data under `~/hermes-spawn/<name>` and the shell alias in `~/.bashrc` may stay — use `hermes-spawn restore <name>` to attach a new container to the data, or `hermes-spawn remove` for a full cleanup).
 
 ## Manual install
 
@@ -179,7 +192,7 @@ sudo rm /usr/local/bin/hermes-spawn
 
 ## How it works
 
-`hermes-spawn` is a thin bash script around a few Docker commands, plus `dashboard`, `update`, and `remove` / `rm` subcommands. On the host, each instance's files live in `~/hermes-spawn/<name>` and are bind-mounted to `/opt/data` in the container. To create an instance, it:
+`hermes-spawn` is a thin bash script around a few Docker commands, plus `restore`, `dashboard`, `update`, and `remove` / `rm` subcommands. On the host, each instance's files live in `~/hermes-spawn/<name>` and are bind-mounted to `/opt/data` in the container. To create an instance, it:
 
 1. Validates inputs and detects conflicts
 2. Calls `docker run ... setup` interactively for the wizard
@@ -187,6 +200,8 @@ sudo rm /usr/local/bin/hermes-spawn
 4. Appends `alias <name>='docker exec -it <name> /opt/hermes/.venv/bin/hermes'` to `~/.bashrc`
 
 `hermes-spawn remove <name>` does the reverse: `docker rm -f`, prunes the alias block, and (unless `--keep-data`) removes `~/hermes-spawn/<name>` after a prompt or ` -y` / `--yes` in non-interactive environments.
+
+`hermes-spawn restore <name>` recreates a gateway container from an existing non-empty data directory (no setup wizard), re-adds the shell alias if needed, and assigns a new localhost gateway port.
 
 `hermes-spawn update <name>` pulls a new image (by default `nousresearch/hermes-agent`), reads the existing container's port mapping, data mount, dashboard settings, and env vars, recreates the gateway container, and leaves data and aliases in place.
 
