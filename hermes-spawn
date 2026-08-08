@@ -4,7 +4,7 @@
 #
 # Usage:  hermes-spawn <name>
 #         hermes-spawn restore <name>
-#         hermes-spawn dashboard <name> [--disable] [--no-tui] [--oauth]
+#         hermes-spawn dashboard <name> [--disable] [--no-tui] [--oauth] [--insecure] [--reset-auth]
 #         hermes-spawn update <name> [--image <ref>] [--no-pull]
 #         hermes-spawn remove|rm <name> [--keep-data] [-y|--yes]
 # Example: hermes-spawn namely
@@ -30,7 +30,7 @@ HERMES_IMAGE="nousresearch/hermes-agent"
 usage_spawn() {
   echo "Usage: $0 <name>" >&2
   echo "       $0 restore <name>" >&2
-  echo "       $0 dashboard <name> [--disable] [--no-tui] [--oauth]" >&2
+  echo "       $0 dashboard <name> [--disable] [--no-tui] [--oauth] [--insecure] [--reset-auth]" >&2
   echo "       $0 update <name> [--image <ref>] [--no-pull]" >&2
   echo "       $0 remove|rm <name> [--keep-data] [-y|--yes]" >&2
   echo "Example: $0 namely" >&2
@@ -172,13 +172,75 @@ env_truthy() {
   return 1
 }
 
+# Return 0 if a TCP port is already listening on the host.
+host_port_is_busy() {
+  local port="$1"
+  ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"
+}
+
 # Find the lowest free TCP port on the host, starting at $1 (default 8642).
 find_free_host_port() {
   local port="${1:-8642}"
-  while ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; do
+  while host_port_is_busy "$port"; do
     port=$((port + 1))
   done
   echo "$port"
+}
+
+# Random signing secret so dashboard sessions survive container restarts.
+generate_dashboard_secret() {
+  if command -v openssl &>/dev/null; then
+    openssl rand -base64 32
+  else
+    head -c 32 /dev/urandom | base64
+  fi
+}
+
+# Prompt for dashboard username/password (sets INSTANCE_DASH_BASIC_*).
+prompt_dashboard_basic_auth() {
+  local user="" pass="" pass2=""
+  local default_user="${INSTANCE_DASH_BASIC_USER:-admin}"
+
+  if [[ ! -t 0 ]]; then
+    echo "Error: dashboard basic auth requires an interactive terminal." >&2
+    echo "       Re-run in a TTY, or use --oauth." >&2
+    return 1
+  fi
+
+  echo ">> Dashboard login (required on current Hermes images when Docker publishes the port)"
+  read -r -p "   Username [$default_user]: " user || true
+  user="${user:-$default_user}"
+  if [[ -z "$user" ]]; then
+    echo "Error: username cannot be empty." >&2
+    return 1
+  fi
+
+  while true; do
+    read -r -s -p "   Password: " pass || true
+    echo
+    if [[ -z "$pass" ]]; then
+      echo "   Password cannot be empty." >&2
+      continue
+    fi
+    if ((${#pass} < 8)); then
+      echo "   Use at least 8 characters." >&2
+      continue
+    fi
+    read -r -s -p "   Confirm password: " pass2 || true
+    echo
+    if [[ "$pass" != "$pass2" ]]; then
+      echo "   Passwords do not match. Try again." >&2
+      continue
+    fi
+    break
+  done
+
+  INSTANCE_DASH_BASIC_USER="$user"
+  INSTANCE_DASH_BASIC_PASSWORD="$pass"
+  if [[ -z "$INSTANCE_DASH_BASIC_SECRET" ]]; then
+    INSTANCE_DASH_BASIC_SECRET="$(generate_dashboard_secret)"
+  fi
+  return 0
 }
 
 # Populated by load_gateway_instance / used by recreate_gateway_instance.
@@ -187,7 +249,11 @@ INSTANCE_GW_HOST_IP=""
 INSTANCE_GW_HOST_PORT=""
 INSTANCE_DASH_ENABLED=0
 INSTANCE_DASH_TUI=0
-INSTANCE_DASH_INSECURE=0
+# Auth mode: basic | oauth | insecure (legacy / explicit --insecure)
+INSTANCE_DASH_AUTH=""
+INSTANCE_DASH_BASIC_USER=""
+INSTANCE_DASH_BASIC_PASSWORD=""
+INSTANCE_DASH_BASIC_SECRET=""
 INSTANCE_DASH_HOST_IP=""
 INSTANCE_DASH_HOST_PORT=""
 INSTANCE_DOCKER_ENV=()
@@ -218,7 +284,10 @@ load_gateway_instance() {
 
   INSTANCE_DASH_ENABLED=0
   INSTANCE_DASH_TUI=0
-  INSTANCE_DASH_INSECURE=0
+  INSTANCE_DASH_AUTH=""
+  INSTANCE_DASH_BASIC_USER=""
+  INSTANCE_DASH_BASIC_PASSWORD=""
+  INSTANCE_DASH_BASIC_SECRET=""
   INSTANCE_DASH_HOST_IP=""
   INSTANCE_DASH_HOST_PORT=""
   INSTANCE_DOCKER_ENV=()
@@ -230,7 +299,8 @@ load_gateway_instance() {
     INSTANCE_DASH_ENABLED=1
   fi
 
-  local oauth_label="" insecure_env_val="" has_insecure_env=0
+  local auth_label="" oauth_label="" insecure_env_val="" has_insecure_env=0
+  auth_label="$(docker inspect --format '{{index .Config.Labels "hermes-spawn.dashboard.auth"}}' "$n" 2>/dev/null || true)"
   oauth_label="$(docker inspect --format '{{index .Config.Labels "hermes-spawn.dashboard.oauth"}}' "$n" 2>/dev/null || true)"
 
   while IFS= read -r env_line; do
@@ -254,27 +324,40 @@ load_gateway_instance() {
       has_insecure_env=1
       insecure_env_val="${env_line#HERMES_DASHBOARD_INSECURE=}"
       ;;
+    HERMES_DASHBOARD_BASIC_AUTH_USERNAME=*)
+      INSTANCE_DASH_BASIC_USER="${env_line#HERMES_DASHBOARD_BASIC_AUTH_USERNAME=}"
+      ;;
+    HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=*)
+      INSTANCE_DASH_BASIC_PASSWORD="${env_line#HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=}"
+      ;;
+    HERMES_DASHBOARD_BASIC_AUTH_SECRET=*)
+      INSTANCE_DASH_BASIC_SECRET="${env_line#HERMES_DASHBOARD_BASIC_AUTH_SECRET=}"
+      ;;
     esac
   done < <(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$n" 2>/dev/null || true)
 
-  if [[ "$oauth_label" == "1" ]]; then
-    INSTANCE_DASH_INSECURE=0
+  if [[ "$auth_label" == "basic" || "$auth_label" == "oauth" || "$auth_label" == "insecure" ]]; then
+    INSTANCE_DASH_AUTH="$auth_label"
+  elif [[ "$oauth_label" == "1" ]]; then
+    INSTANCE_DASH_AUTH="oauth"
+  elif [[ -n "$INSTANCE_DASH_BASIC_USER" && -n "$INSTANCE_DASH_BASIC_PASSWORD" ]]; then
+    INSTANCE_DASH_AUTH="basic"
   elif ((has_insecure_env)) && env_truthy "$insecure_env_val"; then
-    INSTANCE_DASH_INSECURE=1
+    INSTANCE_DASH_AUTH="insecure"
   elif ((INSTANCE_DASH_ENABLED)); then
-    # Default for hermes-spawn dashboards (including legacy containers without the env var).
-    INSTANCE_DASH_INSECURE=1
+    # Legacy hermes-spawn dashboards defaulted to INSECURE=1.
+    INSTANCE_DASH_AUTH="insecure"
   fi
 
   return 0
 }
 
 # Start a gateway container (container must not already exist).
+# Dashboard auth uses INSTANCE_DASH_AUTH + INSTANCE_DASH_BASIC_* globals.
 start_gateway_instance() {
   local n="$1" image="$2"
   local dash_enabled="${3:-0}" dash_tui="${4:-0}"
   local dash_host_ip="${5:-}" dash_host_port="${6:-}"
-  local dash_insecure="${7:-0}"
   local run_args=()
 
   run_args=(
@@ -290,12 +373,34 @@ start_gateway_instance() {
     if ((dash_tui)); then
       run_args+=(-e HERMES_DASHBOARD_TUI=1)
     fi
-    if ((dash_insecure)); then
-      run_args+=(-e HERMES_DASHBOARD_INSECURE=1)
+    case "${INSTANCE_DASH_AUTH:-basic}" in
+    basic)
+      if [[ -z "$INSTANCE_DASH_BASIC_USER" || -z "$INSTANCE_DASH_BASIC_PASSWORD" ]]; then
+        echo "Error: dashboard basic auth is incomplete (missing username/password)." >&2
+        return 1
+      fi
+      run_args+=(-e "HERMES_DASHBOARD_BASIC_AUTH_USERNAME=$INSTANCE_DASH_BASIC_USER")
+      run_args+=(-e "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$INSTANCE_DASH_BASIC_PASSWORD")
+      if [[ -n "$INSTANCE_DASH_BASIC_SECRET" ]]; then
+        run_args+=(-e "HERMES_DASHBOARD_BASIC_AUTH_SECRET=$INSTANCE_DASH_BASIC_SECRET")
+      fi
+      run_args+=(--label hermes-spawn.dashboard.auth=basic)
       run_args+=(--label hermes-spawn.dashboard.oauth=0)
-    else
+      ;;
+    oauth)
+      run_args+=(--label hermes-spawn.dashboard.auth=oauth)
       run_args+=(--label hermes-spawn.dashboard.oauth=1)
-    fi
+      ;;
+    insecure)
+      run_args+=(-e HERMES_DASHBOARD_INSECURE=1)
+      run_args+=(--label hermes-spawn.dashboard.auth=insecure)
+      run_args+=(--label hermes-spawn.dashboard.oauth=0)
+      ;;
+    *)
+      echo "Error: unknown dashboard auth mode '${INSTANCE_DASH_AUTH}'." >&2
+      return 1
+      ;;
+    esac
   fi
   run_args+=(
     -v "$INSTANCE_DATA_MOUNT:/opt/data"
@@ -310,7 +415,21 @@ start_gateway_instance() {
 
 # Recreate a gateway container; preserves dashboard settings when dash_enabled=1.
 recreate_gateway_instance() {
-  local n="$1"
+  local n="$1" image="$2"
+  local dash_enabled="${3:-0}"
+  local dash_host_port="${6:-}"
+  local existing_dash=""
+
+  # Fail before destroying the container if a *new* dashboard port is taken.
+  if ((dash_enabled)) && [[ -n "$dash_host_port" ]]; then
+    existing_dash="$(docker port "$n" 9119/tcp 2>/dev/null | head -n1 || true)"
+    if [[ -z "$existing_dash" ]] && host_port_is_busy "$dash_host_port"; then
+      echo "Error: host port $dash_host_port is already in use." >&2
+      echo "       Free it, then retry (or pick another free port)." >&2
+      return 1
+    fi
+  fi
+
   docker rm -f "$n" >/dev/null
   start_gateway_instance "$@"
 }
@@ -479,6 +598,31 @@ sub_update() {
   dash_host_ip="$INSTANCE_DASH_HOST_IP"
   dash_host_port="$INSTANCE_DASH_HOST_PORT"
 
+  if ((INSTANCE_DASH_ENABLED)); then
+    case "${INSTANCE_DASH_AUTH}" in
+    basic)
+      if [[ -z "$INSTANCE_DASH_BASIC_USER" || -z "$INSTANCE_DASH_BASIC_PASSWORD" ]]; then
+        echo "Error: dashboard on '$n' is missing basic-auth credentials." >&2
+        echo "       Re-enable it interactively:  $0 dashboard $n --reset-auth" >&2
+        return 1
+      fi
+      ;;
+    oauth) ;;
+    insecure)
+      echo "Error: dashboard on '$n' still uses HERMES_DASHBOARD_INSECURE=1." >&2
+      echo "       Current Hermes images ignore that flag and refuse to bind." >&2
+      echo "       Fix with:  $0 dashboard $n" >&2
+      echo "       (prompts for username/password), or:  $0 dashboard $n --oauth" >&2
+      return 1
+      ;;
+    *)
+      echo "Error: dashboard on '$n' has no usable auth provider." >&2
+      echo "       Fix with:  $0 dashboard $n" >&2
+      return 1
+      ;;
+    esac
+  fi
+
   echo ">> Updating '$n'..."
   echo "   Image    : $image"
   echo "   Data dir : $INSTANCE_DATA_MOUNT"
@@ -488,11 +632,10 @@ sub_update() {
     if ((INSTANCE_DASH_TUI)); then
       echo "   Chat tab : enabled"
     fi
-    if ((INSTANCE_DASH_INSECURE)); then
-      echo "   Dashboard auth: localhost / reverse-proxy (HERMES_DASHBOARD_INSECURE=1)"
-    else
-      echo "   Dashboard auth: Hermes OAuth gate"
-    fi
+    case "${INSTANCE_DASH_AUTH}" in
+    basic) echo "   Dashboard auth: username/password (user: $INSTANCE_DASH_BASIC_USER)" ;;
+    oauth) echo "   Dashboard auth: Hermes OAuth gate" ;;
+    esac
   fi
   echo
 
@@ -504,7 +647,7 @@ sub_update() {
   fi
 
   echo ">> Recreating container '$n'..."
-  recreate_gateway_instance "$n" "$image" "$INSTANCE_DASH_ENABLED" "$INSTANCE_DASH_TUI" "$dash_host_ip" "$dash_host_port" "$INSTANCE_DASH_INSECURE"
+  recreate_gateway_instance "$n" "$image" "$INSTANCE_DASH_ENABLED" "$INSTANCE_DASH_TUI" "$dash_host_ip" "$dash_host_port"
 
   cat <<EOF
 
@@ -543,12 +686,16 @@ sub_dashboard() {
   local disable=0
   local no_tui=0
   local oauth=0
+  local insecure=0
+  local reset_auth=0
   shift 2
   while [[ $# -gt 0 ]]; do
     case "$1" in
-    --disable) disable=1 ;;
-    --no-tui)  no_tui=1 ;;
-    --oauth)   oauth=1 ;;
+    --disable)    disable=1 ;;
+    --no-tui)     no_tui=1 ;;
+    --oauth)      oauth=1 ;;
+    --insecure)   insecure=1 ;;
+    --reset-auth) reset_auth=1 ;;
     *)
       echo "Error: $0 dashboard: unknown option: $1" >&2
       return 1
@@ -557,8 +704,16 @@ sub_dashboard() {
     shift
   done
 
-  if ((disable)) && { ((no_tui)) || ((oauth)); }; then
-    echo "Error: $0 dashboard: --disable cannot be combined with --no-tui or --oauth." >&2
+  if ((disable)) && { ((no_tui)) || ((oauth)) || ((insecure)) || ((reset_auth)); }; then
+    echo "Error: $0 dashboard: --disable cannot be combined with other dashboard options." >&2
+    return 1
+  fi
+  if ((oauth)) && ((insecure)); then
+    echo "Error: $0 dashboard: --oauth and --insecure cannot be combined." >&2
+    return 1
+  fi
+  if ((reset_auth)) && { ((oauth)) || ((insecure)); }; then
+    echo "Error: $0 dashboard: --reset-auth only applies to username/password auth (default)." >&2
     return 1
   fi
 
@@ -586,11 +741,13 @@ sub_dashboard() {
     return 1
   fi
 
-  local dash_enabled="$INSTANCE_DASH_ENABLED"
-  local dash_tui="$INSTANCE_DASH_TUI"
-  local dash_insecure="$INSTANCE_DASH_INSECURE"
+  local loaded_auth="$INSTANCE_DASH_AUTH"
+  local dash_enabled=0
+  local dash_tui=0
+  local dash_auth=""
   local dash_host_ip="$INSTANCE_DASH_HOST_IP"
   local dash_host_port="$INSTANCE_DASH_HOST_PORT"
+  local prompted=0
 
   if ((disable)); then
     if ! ((INSTANCE_DASH_ENABLED)); then
@@ -599,9 +756,14 @@ sub_dashboard() {
     fi
     dash_enabled=0
     dash_tui=0
-    dash_insecure=0
+    dash_auth=""
+    INSTANCE_DASH_AUTH=""
+    INSTANCE_DASH_BASIC_USER=""
+    INSTANCE_DASH_BASIC_PASSWORD=""
+    INSTANCE_DASH_BASIC_SECRET=""
     dash_host_ip=""
     dash_host_port=""
+    echo ">> Disabling dashboard on '$n'..."
   else
     dash_enabled=1
     if ((no_tui)); then
@@ -609,42 +771,68 @@ sub_dashboard() {
     else
       dash_tui=1
     fi
+
     if ((oauth)); then
-      dash_insecure=0
+      dash_auth="oauth"
+    elif ((insecure)); then
+      dash_auth="insecure"
+      echo ">> Warning: HERMES_DASHBOARD_INSECURE=1 is a deprecated no-op on current Hermes images."
+      echo "   Prefer the default username/password prompt unless you know you need this escape hatch."
+      echo
     else
-      dash_insecure=1
+      dash_auth="basic"
     fi
-    if [[ -n "$dash_host_ip" ]] && [[ -n "$dash_host_port" ]]; then
-      :
-    else
+
+    if [[ -z "$dash_host_ip" || -z "$dash_host_port" ]]; then
       dash_host_ip="127.0.0.1"
       dash_host_port="$(find_free_host_port 9119)"
     fi
+
+    # Already configured the same way — nothing to do.
     if ((INSTANCE_DASH_ENABLED)) \
        && ((INSTANCE_DASH_TUI == dash_tui)) \
-       && ((INSTANCE_DASH_INSECURE == dash_insecure)); then
+       && [[ "$loaded_auth" == "$dash_auth" ]] \
+       && ! ((reset_auth)) \
+       && { [[ "$dash_auth" != "basic" ]] || [[ -n "$INSTANCE_DASH_BASIC_USER" && -n "$INSTANCE_DASH_BASIC_PASSWORD" ]]; }; then
       echo ">> Dashboard already enabled on '$n'."
       echo "   Gateway   : ${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}"
       echo "   Dashboard : http://${dash_host_ip}:${dash_host_port}"
       if ((dash_tui)); then
         echo "   Chat tab  : enabled"
       else
-        echo "   Chat tab  : disabled (use without --no-tui to enable)"
+        echo "   Chat tab  : disabled (omit --no-tui to enable)"
       fi
-      if ((dash_insecure)); then
-        echo "   Auth      : localhost / reverse-proxy (HERMES_DASHBOARD_INSECURE=1)"
-      else
-        echo "   Auth      : Hermes OAuth gate"
+      case "$dash_auth" in
+      basic)    echo "   Auth      : username/password (user: $INSTANCE_DASH_BASIC_USER)" ;;
+      oauth)    echo "   Auth      : Hermes OAuth gate" ;;
+      insecure) echo "   Auth      : HERMES_DASHBOARD_INSECURE=1 (deprecated)" ;;
+      esac
+      if [[ "$dash_auth" == "basic" ]]; then
+        echo "   Reset     : $0 dashboard $n --reset-auth"
       fi
       return 0
     fi
-  fi
 
-  if ((disable)); then
-    echo ">> Disabling dashboard on '$n'..."
-  else
+    INSTANCE_DASH_AUTH="$dash_auth"
+    if [[ "$dash_auth" == "basic" ]]; then
+      if ((reset_auth)) || [[ -z "$INSTANCE_DASH_BASIC_USER" || -z "$INSTANCE_DASH_BASIC_PASSWORD" ]]; then
+        if ((reset_auth)); then
+          INSTANCE_DASH_BASIC_PASSWORD=""
+        fi
+        if ! prompt_dashboard_basic_auth; then
+          return 1
+        fi
+        prompted=1
+      fi
+    else
+      INSTANCE_DASH_BASIC_USER=""
+      INSTANCE_DASH_BASIC_PASSWORD=""
+      INSTANCE_DASH_BASIC_SECRET=""
+    fi
+
     echo ">> Enabling dashboard on '$n'..."
   fi
+
   echo "   Data dir : $INSTANCE_DATA_MOUNT"
   echo "   Gateway  : ${INSTANCE_GW_HOST_IP}:${INSTANCE_GW_HOST_PORT}  (host -> container 8642)"
   if ((dash_enabled)); then
@@ -654,16 +842,16 @@ sub_dashboard() {
     else
       echo "   Chat tab : disabled"
     fi
-    if ((dash_insecure)); then
-      echo "   Auth     : localhost / reverse-proxy (HERMES_DASHBOARD_INSECURE=1)"
-    else
-      echo "   Auth     : Hermes OAuth gate (--oauth)"
-    fi
+    case "$dash_auth" in
+    basic)    echo "   Auth     : username/password (user: $INSTANCE_DASH_BASIC_USER)" ;;
+    oauth)    echo "   Auth     : Hermes OAuth gate (--oauth)" ;;
+    insecure) echo "   Auth     : HERMES_DASHBOARD_INSECURE=1 (--insecure, deprecated)" ;;
+    esac
   fi
   echo
 
   echo ">> Recreating container '$n'..."
-  recreate_gateway_instance "$n" "$HERMES_IMAGE" "$dash_enabled" "$dash_tui" "$dash_host_ip" "$dash_host_port" "$dash_insecure"
+  recreate_gateway_instance "$n" "$HERMES_IMAGE" "$dash_enabled" "$dash_tui" "$dash_host_ip" "$dash_host_port"
 
   if ((dash_enabled)); then
     cat <<EOF
@@ -678,11 +866,22 @@ EOF
     if ((dash_tui)); then
       echo "  Chat tab  : open the Dashboard URL and use the Chat tab in your browser"
     fi
-    if ((dash_insecure)); then
-      echo "  Auth      : no Hermes OAuth gate (use your own proxy auth if exposing beyond localhost)"
-    else
+    case "$dash_auth" in
+    basic)
+      if ((prompted)); then
+        echo "  Auth      : sign in as '$INSTANCE_DASH_BASIC_USER' with the password you just set"
+      else
+        echo "  Auth      : sign in as '$INSTANCE_DASH_BASIC_USER' (existing password kept)"
+      fi
+      echo "  Reset     : $0 dashboard $n --reset-auth"
+      ;;
+    oauth)
       echo "  Auth      : Hermes OAuth gate (set HERMES_DASHBOARD_OAUTH_CLIENT_ID if required)"
-    fi
+      ;;
+    insecure)
+      echo "  Auth      : HERMES_DASHBOARD_INSECURE=1 (ignored on current Hermes images)"
+      ;;
+    esac
     cat <<EOF
 
 Docker commands:

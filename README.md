@@ -62,7 +62,7 @@ Example: `hermes` — drops you into chat. Use `/exit` or Ctrl+D to leave.
 hermes-spawn dashboard <name>
 ```
 
-Example: `hermes-spawn dashboard hermes` — opens a browser UI at `http://127.0.0.1:<port>` (dashboard port starts at 9119). The Chat tab is on by default. See [Managing instances](#managing-instances) for `--no-tui`, `--oauth`, `--disable`, and remote access.
+Example: `hermes-spawn dashboard hermes` — prompts for a dashboard username/password, then opens a browser UI at `http://127.0.0.1:<port>` (dashboard port starts at 9119). The Chat tab is on by default. See [Managing instances](#managing-instances) for `--no-tui`, `--oauth`, `--disable`, and remote access.
 
 That's it.
 
@@ -124,15 +124,16 @@ By default, `update` runs `docker pull nousresearch/hermes-agent` (the `latest` 
 
 ```bash
 hermes-spawn dashboard <name>
-hermes-spawn dashboard hermes              # example — dashboard + browser Chat tab
-hermes-spawn dashboard hermes --no-tui     # dashboard without the Chat tab
-hermes-spawn dashboard hermes --oauth      # use Hermes OAuth gate instead of INSECURE
-hermes-spawn dashboard hermes --disable    # turn dashboard off again
+hermes-spawn dashboard hermes                 # example — prompts for login, Chat tab on
+hermes-spawn dashboard hermes --no-tui        # dashboard without the Chat tab
+hermes-spawn dashboard hermes --oauth         # Hermes OAuth gate instead of password
+hermes-spawn dashboard hermes --reset-auth    # set a new username/password
+hermes-spawn dashboard hermes --disable       # turn dashboard off again
 ```
 
-This recreates the existing gateway container with `HERMES_DASHBOARD=1`, `HERMES_DASHBOARD_TUI=1` (Chat tab on by default), and **`HERMES_DASHBOARD_INSECURE=1` by default** so the dashboard works on localhost without Nous Portal OAuth (required on recent Hermes images when the dashboard binds to `0.0.0.0` inside the container). Use **`--oauth`** if you want Hermes's built-in OAuth gate instead — typical when you've configured `HERMES_DASHBOARD_OAUTH_CLIENT_ID`. If you terminate auth at Caddy or another reverse proxy, keep the default (do not use `--oauth`).
+This recreates the existing gateway container with `HERMES_DASHBOARD=1` and `HERMES_DASHBOARD_TUI=1` (Chat tab on by default). **By default it prompts interactively for a username and password** and passes them as `HERMES_DASHBOARD_BASIC_AUTH_*` — required on current Hermes images, which bind the dashboard to `0.0.0.0` inside the container and refuse to start without an auth provider (`HERMES_DASHBOARD_INSECURE=1` is now a deprecated no-op). Use **`--oauth`** if you want Hermes's built-in OAuth gate instead (typically with `HERMES_DASHBOARD_OAUTH_CLIENT_ID`). Credentials are kept on the container so `hermes-spawn update` can recreate it without re-prompting; use `--reset-auth` to change them.
 
-The command publishes a localhost dashboard port starting at 9119 and leaves your data and shell alias unchanged. Open `http://127.0.0.1:<port>` in a browser.
+The command publishes a localhost dashboard port starting at 9119 and leaves your data and shell alias unchanged. Open `http://127.0.0.1:<port>` in a browser and sign in with the credentials you set.
 
 On a remote server, tunnel the dashboard port first:
 
@@ -176,7 +177,7 @@ sudo chmod +x /usr/local/bin/hermes-spawn
 ## Security notes
 
 - **Gateway ports are bound to `127.0.0.1` by default.** They are not reachable from the internet. To access remotely, use SSH tunneling, Tailscale, or a reverse proxy with authentication. The Hermes gateway has no built-in auth.
-- **The web dashboard has no Hermes OAuth gate by default** (`HERMES_DASHBOARD_INSECURE=1`) so localhost and SSH-tunnel access work without Nous Portal login. It can still read/write API keys in `.env`. Dashboard ports are bound to `127.0.0.1` on the host — if you expose it via a reverse proxy, use your proxy's auth; only pass `--oauth` to `hermes-spawn dashboard` when you want Hermes's OAuth gate instead.
+- **The web dashboard requires login by default** (Hermes username/password provider). Current Hermes images ignore `HERMES_DASHBOARD_INSECURE=1` and fail closed on a non-loopback bind without an auth provider. Dashboard ports are still bound to `127.0.0.1` on the host; the password gate is what satisfies Hermes inside Docker. Pass `--oauth` only when you want Hermes's OAuth gate instead. The dashboard can still read/write API keys in `.env` after you sign in.
 - **Do not reuse bot tokens** across instances. Hermes has built-in token locks that will refuse to start a second gateway with the same token, but it's cleaner to use unique tokens from the start.
 - **API key budget alerts.** Customer-facing instances can rack up costs fast if abused. Set spending limits in your provider's dashboard.
 - **The data directory is `chmod 777`** to work around Docker UID/GID mismatches. On a single-user VPS this is fine; on shared hosts, restrict access to the parent directory.
@@ -208,7 +209,7 @@ sudo rm /usr/local/bin/hermes-spawn
 
 `hermes-spawn update <name>` pulls a new image (by default `nousresearch/hermes-agent`), reads the existing container's port mapping, data mount, dashboard settings, and env vars, recreates the gateway container, and leaves data and aliases in place.
 
-`hermes-spawn dashboard <name>` enables or disables Hermes's built-in web dashboard as a side-process in the same container (`HERMES_DASHBOARD=1`, optional `HERMES_DASHBOARD_TUI=1` for the browser Chat tab, `HERMES_DASHBOARD_INSECURE=1` by default or `--oauth` for the OAuth gate), following the [official Docker pattern](https://hermes-agent.nousresearch.com/docs/user-guide/docker#running-the-dashboard).
+`hermes-spawn dashboard <name>` enables or disables Hermes's built-in web dashboard as a side-process in the same container (`HERMES_DASHBOARD=1`, optional `HERMES_DASHBOARD_TUI=1` for the browser Chat tab, interactive basic auth by default or `--oauth` for the OAuth gate), following the [official Docker pattern](https://hermes-agent.nousresearch.com/docs/user-guide/docker#running-the-dashboard).
 
 Read the script — it's plain bash with no dependencies beyond Docker and standard Unix tools. <https://github.com/oscarfrank/hermes-spawn/blob/main/hermes-spawn>
 
