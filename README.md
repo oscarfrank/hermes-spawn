@@ -104,7 +104,10 @@ hermes-spawn connect hermes --status      # API server, plugin, address: is it a
 hermes-spawn connect hermes --show-key    # print the key too, to type it in by hand
 hermes-spawn connect hermes --off         # stop sharing it (removes the Caddy site / tunnel / Tailscale serve)
 hermes-spawn connect hermes --caddy --domain hermes.example.com   # skip the questions
+hermes-spawn connect hermes --url https://hermes.example.com      # you already have an address
 ```
+
+**Already reach Hermes through your own nginx, Caddy site or tunnel?** Use `--url` with that address. `connect` changes nothing about your route: it checks the API server and the plugin, checks the address answers, remembers it for `--status`, and prints the QR code. `--off` then only forgets it.
 
 Running `connect` again is safe: it keeps what already works and fixes what doesn't. `hermes-spawn remove <name>` takes the instance's address down with it, and `connect` clears away any address left by an instance that no longer exists.
 

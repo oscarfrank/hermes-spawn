@@ -6,7 +6,7 @@
 #         hermes-spawn restore <name>
 #         hermes-spawn dashboard <name> [--disable] [--no-tui] [--oauth] [--insecure] [--reset-auth]
 #         hermes-spawn update <name> [--image <ref>] [--no-pull]
-#         hermes-spawn connect <name> [--caddy|--cloudflare|--tailscale] [--domain <d>] [--status] [--off] [--show-key] [-y]
+#         hermes-spawn connect <name> [--caddy|--cloudflare|--tailscale|--url <https://...>] [--domain <d>] [--status] [--off] [--show-key] [-y]
 #         hermes-spawn remove|rm <name> [--keep-data] [-y|--yes]
 # Example: hermes-spawn namely
 #          hermes-spawn restore namely
@@ -34,7 +34,7 @@ usage_spawn() {
   echo "       $0 restore <name>" >&2
   echo "       $0 dashboard <name> [--disable] [--no-tui] [--oauth] [--insecure] [--reset-auth]" >&2
   echo "       $0 update <name> [--image <ref>] [--no-pull]" >&2
-  echo "       $0 connect <name> [--caddy|--cloudflare|--tailscale] [--domain <d>] [--status] [--off] [--show-key] [-y]" >&2
+  echo "       $0 connect <name> [--caddy|--cloudflare|--tailscale|--url <https://...>] [--domain <d>] [--status] [--off] [--show-key] [-y]" >&2
   echo "       $0 remove|rm <name> [--keep-data] [-y|--yes]" >&2
   echo "Example: $0 namely" >&2
   echo "         $0 restore namely" >&2
@@ -1450,6 +1450,27 @@ connect_tailscale() {
   connect_state_save "$n" "METHOD=tailscale" "URL=$CONNECT_URL" "TS_PORT=$https_port"
 }
 
+# Your own address: an HTTPS route you already set up yourself (nginx, Caddy,
+# a tunnel) to 127.0.0.1:<port>. Nothing is changed; it is checked and
+# remembered, so --status and the QR code work.
+connect_existing_url() {
+  local n="$1" url="${2%/}"
+  if [[ "$url" != https://* ]]; then
+    echo "Error: --url must start with https:// (Hermsy needs HTTPS)." >&2
+    return 1
+  fi
+  CONNECT_URL="$url"
+  connect_state_save "$n" "METHOD=url" "URL=$CONNECT_URL"
+}
+
+# How an instance's address was set up, in words.
+connect_method_label() {
+  case "$1" in
+  url) echo "your own" ;;
+  *) echo "$1" ;;
+  esac
+}
+
 # --- the QR code --------------------------------------------------------------
 
 # Prints a QR code Hermsy scans: hermsy://connect?url=...&key=...
@@ -1503,7 +1524,7 @@ connect_status() {
   if [[ -n "$method" ]]; then
     local code
     code="$(gateway_status_code "$url/health")"
-    echo "   Address    : $url ($method) — $( [[ "$code" == 200 ]] && echo reachable || echo "not reachable (HTTP $code)")"
+    echo "   Address    : $url ($(connect_method_label "$method")) — $( [[ "$code" == 200 ]] && echo reachable || echo "not reachable (HTTP $code)")"
   else
     echo "   Address    : none yet"
   fi
@@ -1572,6 +1593,11 @@ connect_off() {
   tailscale)
     as_root tailscale serve --https="$(connect_state_get "$n" TS_PORT)" off >/dev/null 2>&1 || true
     ;;
+  url)
+    rm -f "$CONNECT_STATE_DIR/$n"
+    echo ">> Forgot the address of '$n'. You set it up yourself, so it is left as it is."
+    return 0
+    ;;
   "")
     echo ">> '$n' has no address set up by hermes-spawn. Nothing to do."
     return 0
@@ -1585,13 +1611,16 @@ connect_off() {
 
 sub_connect() {
   local n="${2-}"
-  local method="" domain="" want_status=0 want_off=0 show_key=0
+  local method="" domain="" given_url="" want_status=0 want_off=0 show_key=0
   shift 2 || true
   while [[ $# -gt 0 ]]; do
     case "$1" in
     --caddy)      method=caddy ;;
     --cloudflare) method=cloudflare ;;
     --tailscale)  method=tailscale ;;
+    --url)
+      [[ $# -ge 2 ]] || { echo "Error: --url needs an address, e.g. --url https://hermes.example.com" >&2; return 1; }
+      method=url; given_url="$2"; shift ;;
     --domain)
       [[ $# -ge 2 ]] || { echo "Error: --domain needs a value." >&2; return 1; }
       domain="$2"; shift ;;
@@ -1661,7 +1690,7 @@ sub_connect() {
   # An address the phone can reach over HTTPS: keep a working one.
   CONNECT_URL="$(connect_state_get "$n" URL)"
   if [[ -n "$CONNECT_URL" && -z "$method" && "$(gateway_status_code "$CONNECT_URL/health")" == 200 ]]; then
-    echo "   Address ...... $CONNECT_URL ($(connect_state_get "$n" METHOD), already set up)"
+    echo "   Address ...... $CONNECT_URL ($(connect_method_label "$(connect_state_get "$n" METHOD)"), already set up)"
   else
     if [[ -z "$method" ]]; then
       local ip suggest=tailscale owner80 owner443
@@ -1687,12 +1716,19 @@ sub_connect() {
         esac
       fi
     fi
-    if [[ "$method" != tailscale ]]; then
+    # Switching to another way: the old route comes down first.
+    local before
+    before="$(connect_state_get "$n" METHOD)"
+    if [[ -n "$before" && "$before" != "$method" ]]; then
+      connect_off "$n" >/dev/null || true
+    fi
+    if [[ "$method" == caddy || "$method" == cloudflare ]]; then
       echo
       echo "   Note: Hermes will be reachable from the internet, guarded by its API key"
       echo "   (64 random characters). Anyone with the key can use your agent; keep it private."
     fi
     case "$method" in
+    url)        connect_existing_url "$n" "$given_url" || return 1 ;;
     caddy)      connect_caddy "$n" "$domain" || return 1 ;;
     cloudflare) connect_cloudflare "$n" "$domain" || return 1 ;;
     tailscale)  connect_tailscale "$n" || return 1 ;;
