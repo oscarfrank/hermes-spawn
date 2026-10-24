@@ -89,7 +89,7 @@ hermes-spawn connect hermes
 
    | | Best for | You do |
    |---|---|---|
-   | **Caddy** | A server with a public IP (most VPSs) | Nothing: an automatic address like `https://203-0-113-5.sslip.io`. Or type your own domain and add one DNS record. |
+   | **Caddy** | A server with a public IP (most VPSs) | Nothing: an automatic address like `https://<name>.203-0-113-5.sslip.io`, one per instance. Or type your own domain and add one DNS record. |
    | **Cloudflare Tunnel** | A machine at home; no open ports | Click one login link (your domain must be on Cloudflare). |
    | **Tailscale** | Keeping Hermes private | Click one login link; install Tailscale on your phone. |
 
@@ -106,7 +106,7 @@ hermes-spawn connect hermes --off         # stop sharing it (removes the Caddy s
 hermes-spawn connect hermes --caddy --domain hermes.example.com   # skip the questions
 ```
 
-Running `connect` again is safe: it keeps what already works and fixes what doesn't.
+Running `connect` again is safe: it keeps what already works and fixes what doesn't. `hermes-spawn remove <name>` takes the instance's address down with it, and `connect` clears away any address left by an instance that no longer exists.
 
 > **Security.** With Caddy or Cloudflare, your agent is reachable from the internet, guarded by its API key (64 random characters). Anyone with the key can use your agent, so keep the QR code and key private. With Tailscale, nothing is public at all.
 >

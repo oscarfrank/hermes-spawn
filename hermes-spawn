@@ -494,6 +494,12 @@ sub_remove() {
     return 1
   fi
 
+  # Its HTTPS address (connect) goes first: the port may be reused later.
+  if [[ -f "$HOME/hermes-spawn/.connect/$n" ]]; then
+    echo ">> Taking down the address 'connect' set up for '$n'..."
+    connect_off "$n" >/dev/null || true
+  fi
+
   if ((has_dock)); then
     echo ">> Removing container '$n'..."
     docker rm -f "$n" >/dev/null
@@ -1240,7 +1246,7 @@ connect_caddy() {
 
   if [[ -z "$domain" ]] && [[ -t 0 ]]; then
     echo
-    echo "   Address: press Enter for an automatic one (${ip//./-}.sslip.io, nothing to set up),"
+    echo "   Address: press Enter for an automatic one (${n}.${ip//./-}.sslip.io, nothing to set up),"
     read -r -p "   or type your own domain (e.g. hermes.example.com): " domain || true
   fi
   if [[ -z "$domain" ]]; then
@@ -1249,7 +1255,8 @@ connect_caddy() {
       echo "       Use --tailscale or --cloudflare instead." >&2
       return 1
     fi
-    host="${ip//./-}.sslip.io"
+    # The instance's name in front keeps several instances on one server apart.
+    host="${n}.${ip//./-}.sslip.io"
   else
     host="${domain,,}"
     host="${host#https://}"; host="${host%%/*}"
@@ -1299,7 +1306,14 @@ connect_caddy() {
   local begin="# hermes-spawn connect: $n" end="# end hermes-spawn connect: $n"
   local current
   current="$(as_root cat "$caddyfile" 2>/dev/null || true)"
-  # Someone else's site for this name: never touch it.
+  # Another instance's address, or someone else's site: never touch it.
+  local owner
+  owner="$(caddy_site_owners "$host" | grep -vx "$n" | head -n1 || true)"
+  if [[ -n "$owner" ]]; then
+    echo "Error: $host is already the address of instance '$owner'." >&2
+    echo "       Choose another address, or free it:  $0 connect $owner --off" >&2
+    return 1
+  fi
   local others
   others="$(awk -v b="$begin" -v e="$end" '$0==b{skip=1} !skip{print} $0==e{skip=0}' <<<"$current")"
   if grep -qE "^[[:space:]]*(https?://)?${host//./\\.}(:443)?[[:space:]]*(,|\{)" <<<"$others"; then
@@ -1495,21 +1509,61 @@ connect_status() {
   fi
 }
 
+# Removes the Caddy site hermes-spawn added for instance $1 (if any),
+# validating before reloading.
+caddy_drop_site() {
+  local n="$1" caddyfile="/etc/caddy/Caddyfile"
+  local begin="# hermes-spawn connect: $n" end="# end hermes-spawn connect: $n"
+  as_root grep -qxF "$begin" "$caddyfile" 2>/dev/null || return 0
+  as_root cp -p "$caddyfile" "${caddyfile}.bak-connect-$(date -u +%Y%m%dT%H%M%SZ)"
+  as_root cat "$caddyfile" | awk -v b="$begin" -v e="$end" '$0==b{skip=1} !skip{print} $0==e{skip=0}' | as_root tee "${caddyfile}.hermes-spawn.new" >/dev/null
+  as_root caddy validate --config "${caddyfile}.hermes-spawn.new" --adapter caddyfile >/dev/null 2>&1 || {
+    as_root rm -f "${caddyfile}.hermes-spawn.new"
+    echo "Error: Caddy config did not validate without the site for '$n'; nothing was changed." >&2
+    return 1
+  }
+  as_root sh -c "cat '${caddyfile}.hermes-spawn.new' > '$caddyfile' && rm -f '${caddyfile}.hermes-spawn.new'"
+  as_root systemctl reload caddy 2>/dev/null || as_root caddy reload --config "$caddyfile" --adapter caddyfile
+}
+
+# Instances whose hermes-spawn Caddy site serves host $1, one per line.
+caddy_site_owners() {
+  as_root cat /etc/caddy/Caddyfile 2>/dev/null | awk -v h="$1" '
+    index($0, "# hermes-spawn connect: ") == 1 { name = substr($0, 25); next }
+    index($0, "# end hermes-spawn connect: ") == 1 { name = ""; next }
+    name != "" { line = $0; sub(/^[ \t]+/, "", line); sub(/^https?:\/\//, "", line)
+      if (line == h || index(line, h " ") == 1 || index(line, h "{") == 1 || index(line, h ",") == 1) print name }' | sort -u || true
+}
+
+# Takes down addresses left behind by instances that no longer exist (removed
+# before `remove` knew about connect): their port may now belong to another
+# instance, and must not lead there.
+connect_forget_gone() {
+  local f name
+  for f in "$CONNECT_STATE_DIR"/*; do
+    [[ -f "$f" ]] || continue
+    name="$(basename "$f")"
+    if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$name"; then
+      echo ">> Taking down the address of '$name', which no longer exists..."
+      connect_off "$name" >/dev/null || true
+    fi
+  done
+  if [[ -f /etc/caddy/Caddyfile ]]; then
+    for name in $(as_root grep -oE '^# hermes-spawn connect: [a-z0-9-]+$' /etc/caddy/Caddyfile 2>/dev/null | awk '{print $4}' || true); do
+      if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$name"; then
+        echo ">> Removing the Caddy site of '$name', which no longer exists..."
+        caddy_drop_site "$name" || true
+      fi
+    done
+  fi
+}
+
 connect_off() {
   local n="$1" method
   method="$(connect_state_get "$n" METHOD)"
   case "$method" in
   caddy)
-    local caddyfile="/etc/caddy/Caddyfile" begin="# hermes-spawn connect: $n" end="# end hermes-spawn connect: $n"
-    as_root cp -p "$caddyfile" "${caddyfile}.bak-connect-$(date -u +%Y%m%dT%H%M%SZ)"
-    as_root cat "$caddyfile" | awk -v b="$begin" -v e="$end" '$0==b{skip=1} !skip{print} $0==e{skip=0}' | as_root tee "${caddyfile}.hermes-spawn.new" >/dev/null
-    as_root caddy validate --config "${caddyfile}.hermes-spawn.new" --adapter caddyfile >/dev/null 2>&1 || {
-      as_root rm -f "${caddyfile}.hermes-spawn.new"
-      echo "Error: Caddy config did not validate without the site; nothing was changed." >&2
-      return 1
-    }
-    as_root sh -c "cat '${caddyfile}.hermes-spawn.new' > '$caddyfile' && rm -f '${caddyfile}.hermes-spawn.new'"
-    as_root systemctl reload caddy 2>/dev/null || as_root caddy reload --config "$caddyfile" --adapter caddyfile
+    caddy_drop_site "$n" || return 1
     ;;
   cloudflare)
     docker rm -f "${n}-tunnel" >/dev/null 2>&1 || true
@@ -1562,6 +1616,7 @@ sub_connect() {
 
   if ((want_status)); then connect_status "$n"; return $?; fi
   if ((want_off)); then connect_off "$n"; return $?; fi
+  connect_forget_gone
 
   echo ">> Connecting '$n' to the Hermsy phone app"
   CONNECT_CHANGED=0
