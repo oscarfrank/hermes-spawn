@@ -6,11 +6,13 @@
 #         hermes-spawn restore <name>
 #         hermes-spawn dashboard <name> [--disable] [--no-tui] [--oauth] [--insecure] [--reset-auth]
 #         hermes-spawn update <name> [--image <ref>] [--no-pull]
+#         hermes-spawn connect <name> [--caddy|--cloudflare|--tailscale] [--domain <d>] [--status] [--off] [--show-key] [-y]
 #         hermes-spawn remove|rm <name> [--keep-data] [-y|--yes]
 # Example: hermes-spawn namely
 #          hermes-spawn restore namely
 #          hermes-spawn dashboard namely
 #          hermes-spawn update namely
+#          hermes-spawn connect namely
 #          hermes-spawn remove namely
 #
 # Behavior: ALL preflight checks run first. If anything is already taken
@@ -32,11 +34,13 @@ usage_spawn() {
   echo "       $0 restore <name>" >&2
   echo "       $0 dashboard <name> [--disable] [--no-tui] [--oauth] [--insecure] [--reset-auth]" >&2
   echo "       $0 update <name> [--image <ref>] [--no-pull]" >&2
+  echo "       $0 connect <name> [--caddy|--cloudflare|--tailscale] [--domain <d>] [--status] [--off] [--show-key] [-y]" >&2
   echo "       $0 remove|rm <name> [--keep-data] [-y|--yes]" >&2
   echo "Example: $0 namely" >&2
   echo "         $0 restore namely" >&2
   echo "         $0 dashboard namely" >&2
   echo "         $0 update namely" >&2
+  echo "         $0 connect namely      # phone app (Hermsy): API server, plugin, HTTPS address" >&2
   echo "         $0 remove namely" >&2
   exit 1
 }
@@ -1025,6 +1029,671 @@ EOF
 }
 
 # =========================================================================
+# Subcommand: connect (phone app: API server + Hermsy plugin + HTTPS address)
+# =========================================================================
+
+HERMSY_PLUGIN_REPO="illbytes/hermsy-hermes"
+CONNECT_STATE_DIR="$HOME/hermes-spawn/.connect"
+CLOUDFLARED_IMAGE="cloudflare/cloudflared:latest"
+
+# Run a command as root (prefix sudo when we are not root).
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo &>/dev/null; then
+    sudo "$@"
+  else
+    echo "Error: this step needs root, and sudo is not available." >&2
+    return 1
+  fi
+}
+
+# Last value of KEY in an env file (quotes stripped), or empty.
+env_file_get() {
+  local f="$1" key="$2" line=""
+  [[ -f "$f" ]] || return 0
+  line="$(grep -E "^[[:space:]]*${key}=" "$f" 2>/dev/null | tail -n1 || true)"
+  line="${line#*=}"
+  line="${line%\"}"; line="${line#\"}"
+  line="${line%\'}"; line="${line#\'}"
+  printf '%s' "$line"
+}
+
+# Set KEY=VALUE in an env file, replacing an existing line. Writes in place
+# (same file, owner and mode), after one backup per run.
+env_file_set() {
+  local f="$1" key="$2" value="$3" tmp
+  if [[ -z "${CONNECT_ENV_BACKED_UP-}" ]]; then
+    cp -p "$f" "${f}.bak-connect-$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
+    CONNECT_ENV_BACKED_UP=1
+  fi
+  tmp="$(mktemp)"
+  if grep -qE "^[[:space:]]*${key}=" "$f" 2>/dev/null; then
+    awk -v k="$key" -v v="$value" 'BEGIN{done=0}
+      $0 ~ "^[[:space:]]*" k "=" { if (!done) { print k "=" v; done=1 }; next }
+      { print }' "$f" > "$tmp"
+  else
+    cat "$f" > "$tmp"
+    [[ -s "$tmp" && "$(tail -c1 "$tmp")" != "" ]] && echo >> "$tmp"
+    echo "${key}=${value}" >> "$tmp"
+  fi
+  cat "$tmp" > "$f"
+  rm -f "$tmp"
+}
+
+# Python inside the instance's container (it has qrcode); stdin passes through.
+instance_python() {
+  local n="$1"; shift
+  docker exec -i "$n" /opt/hermes/.venv/bin/python "$@"
+}
+
+# Hermes's own CLI inside the container, as the hermes user.
+instance_hermes() {
+  local n="$1"; shift
+  docker exec --user hermes "$n" /opt/hermes/.venv/bin/hermes "$@"
+}
+
+# HTTP status of GET/POST against the local gateway.
+gateway_status_code() {
+  local url="$1" key="${2-}" body="${3-}"
+  local args=(-s -o /dev/null -w '%{http_code}' -m 10)
+  [[ -n "$key" ]] && args+=(-H "Authorization: Bearer $key")
+  if [[ -n "$body" ]]; then
+    args+=(-X POST -H 'Content-Type: application/json' -d "$body")
+  fi
+  curl "${args[@]}" "$url" 2>/dev/null || echo 000
+}
+
+# Wait until $1/health answers 200 (gateway restarts take a few seconds).
+wait_for_health() {
+  local base="$1" tries="${2:-60}" i
+  for ((i = 0; i < tries; i++)); do
+    [[ "$(gateway_status_code "$base/health")" == 200 ]] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# The Hermsy plugin's answer to "hello" (JSON), or empty.
+plugin_hello() {
+  local base="$1" key="$2"
+  curl -s -m 15 -X POST "$base/api/platforms/hermsy/events" \
+    -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+    -d '{"op":"hello"}' 2>/dev/null || true
+}
+
+# This machine's outgoing IPv4 address, and whether it is public.
+local_ipv4() {
+  ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}' || true
+}
+
+ipv4_is_public() {
+  local ip="$1"
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  case "$ip" in
+  10.* | 127.* | 192.168.* | 169.254.*) return 1 ;;
+  172.1[6-9].* | 172.2[0-9].* | 172.3[0-1].*) return 1 ;;
+  100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].*) return 1 ;;
+  esac
+  return 0
+}
+
+# Name of the process listening on a TCP port, or empty.
+port_owner() {
+  # `|| true`: under pipefail, head closing the pipe early must not fail us.
+  as_root ss -ltnpH "sport = :$1" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -n1 || true
+}
+
+# IPv4 addresses a host name resolves to, one per line.
+resolve_ipv4() {
+  getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u || true
+}
+
+connect_state_get() {
+  local n="$1" key="$2"
+  env_file_get "$CONNECT_STATE_DIR/$n" "$key"
+}
+
+connect_state_save() {
+  local n="$1"; shift
+  mkdir -p "$CONNECT_STATE_DIR"
+  chmod 700 "$CONNECT_STATE_DIR"
+  printf '%s\n' "$@" > "$CONNECT_STATE_DIR/$n"
+}
+
+# --- step 1: API server -------------------------------------------------------
+
+# Switch on the API server in the instance's .env. Sets CONNECT_KEY and
+# CONNECT_CHANGED=1 when the container needs a restart.
+connect_api_server() {
+  local n="$1" envf="$INSTANCE_DATA_MOUNT/.env"
+  if [[ ! -f "$envf" ]]; then
+    echo "Error: $envf not found; is '$n' a Hermes instance?" >&2
+    return 1
+  fi
+  if ! env_truthy "$(env_file_get "$envf" API_SERVER_ENABLED)"; then
+    env_file_set "$envf" API_SERVER_ENABLED true
+    CONNECT_CHANGED=1
+  fi
+  # Inside Docker the server must listen on all interfaces; the host side
+  # stays on 127.0.0.1 (docker -p 127.0.0.1:PORT:8642).
+  if [[ "$(env_file_get "$envf" API_SERVER_HOST)" != "0.0.0.0" ]]; then
+    env_file_set "$envf" API_SERVER_HOST 0.0.0.0
+    CONNECT_CHANGED=1
+  fi
+  local port
+  port="$(env_file_get "$envf" API_SERVER_PORT)"
+  if [[ -n "$port" && "$port" != 8642 ]]; then
+    env_file_set "$envf" API_SERVER_PORT 8642
+    CONNECT_CHANGED=1
+  fi
+  CONNECT_KEY="$(env_file_get "$envf" API_SERVER_KEY)"
+  if ((${#CONNECT_KEY} < 32)); then
+    if [[ -n "$CONNECT_KEY" ]]; then
+      echo "   (the existing API_SERVER_KEY is short; replacing it with a strong one)"
+    fi
+    CONNECT_KEY="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    env_file_set "$envf" API_SERVER_KEY "$CONNECT_KEY"
+    CONNECT_CHANGED=1
+  fi
+}
+
+# --- step 2: Hermsy plugin ----------------------------------------------------
+
+connect_plugin() {
+  local n="$1" listed
+  # Captured whole: with pipefail, `grep -q` would end the pipe early and
+  # turn a match into a failure.
+  listed="$(instance_hermes "$n" plugins list --json 2>/dev/null || true)"
+  if grep -qE '"name": *"hermsy"[^}]*"status": *"enabled"' <<<"$(tr -d '\n' <<<"$listed" | sed 's/},/}\n/g')"; then
+    return 0
+  fi
+  echo ">> Installing the Hermsy plugin ($HERMSY_PLUGIN_REPO)..."
+  if ! instance_hermes "$n" plugins install "$HERMSY_PLUGIN_REPO" --enable >/tmp/hermes-spawn-plugin.$$ 2>&1; then
+    tail -n 15 /tmp/hermes-spawn-plugin.$$ >&2
+    rm -f /tmp/hermes-spawn-plugin.$$
+    echo "Error: could not install the Hermsy plugin." >&2
+    return 1
+  fi
+  rm -f /tmp/hermes-spawn-plugin.$$
+  CONNECT_CHANGED=1
+}
+
+# --- step 3: an HTTPS address -------------------------------------------------
+
+# Caddy: an automatic sslip.io name for the server's IP, or the person's
+# own domain. Installs Caddy when it is missing; adds one marked site to the
+# Caddyfile, validates it, and reloads.
+connect_caddy() {
+  local n="$1" domain="${2-}" ip host caddyfile="/etc/caddy/Caddyfile"
+  ip="$(local_ipv4)"
+
+  local owner p
+  for p in 80 443; do
+    owner="$(port_owner "$p")"
+    if [[ -n "$owner" && "$owner" != caddy ]]; then
+      echo "Error: port $p is used by '$owner', so Caddy cannot serve HTTPS here." >&2
+      echo "       Use --cloudflare or --tailscale instead, or add a site for 127.0.0.1:${INSTANCE_GW_HOST_PORT} in $owner." >&2
+      return 1
+    fi
+  done
+
+  if [[ -z "$domain" ]] && [[ -t 0 ]]; then
+    echo
+    echo "   Address: press Enter for an automatic one (${ip//./-}.sslip.io, nothing to set up),"
+    read -r -p "   or type your own domain (e.g. hermes.example.com): " domain || true
+  fi
+  if [[ -z "$domain" ]]; then
+    if ! ipv4_is_public "$ip"; then
+      echo "Error: this machine has no public IPv4 address ($ip), so an automatic address cannot reach it." >&2
+      echo "       Use --tailscale or --cloudflare instead." >&2
+      return 1
+    fi
+    host="${ip//./-}.sslip.io"
+  else
+    host="${domain,,}"
+    host="${host#https://}"; host="${host%%/*}"
+    local resolved
+    resolved="$(resolve_ipv4 "$host")"
+    while ! grep -qx "$ip" <<<"$resolved"; do
+      echo
+      if [[ -z "$resolved" ]]; then
+        echo "   $host does not resolve yet. Add this DNS record at your DNS provider:"
+      else
+        echo "   $host points at $(echo "$resolved" | tr '\n' ' ')instead of this server. Set this DNS record:"
+      fi
+      echo "      Type A   Name ${host%%.*}   Value $ip"
+      echo "   On Cloudflare, set it to \"DNS only\" (grey cloud): the proxy breaks Caddy's certificate."
+      if [[ ! -t 0 ]]; then
+        return 1
+      fi
+      read -r -p "   Press Enter to check again (or Ctrl-C to stop) " _ || return 1
+      resolved="$(resolve_ipv4 "$host")"
+    done
+  fi
+
+  if ! command -v caddy &>/dev/null; then
+    echo ">> Caddy is not installed. It serves Hermes over HTTPS and renews the certificate itself."
+    if [[ -t 0 ]] && [[ -z "${CONNECT_YES-}" ]]; then
+      read -r -p "   Install Caddy now? [Y/n] " ans || true
+      [[ "$ans" =~ ^[nN] ]] && return 1
+    fi
+    if ! command -v apt-get &>/dev/null; then
+      echo "Error: automatic install supports Debian/Ubuntu. Install Caddy (https://caddyserver.com/docs/install), then re-run." >&2
+      return 1
+    fi
+    as_root apt-get update -qq
+    as_root apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg >/dev/null
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | as_root gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | as_root tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+    as_root apt-get update -qq
+    as_root apt-get install -y -qq caddy >/dev/null
+    # A fresh install serves a welcome page on :80; Hermes takes its place.
+    if grep -qE '^:80[[:space:]]*\{' "$caddyfile" 2>/dev/null && grep -q 'usr/share/caddy' "$caddyfile"; then
+      as_root cp -p "$caddyfile" "${caddyfile}.orig"
+      echo "# Sites added by hermes-spawn connect follow." | as_root tee "$caddyfile" >/dev/null
+    fi
+    echo ">> Caddy installed."
+  fi
+
+  local begin="# hermes-spawn connect: $n" end="# end hermes-spawn connect: $n"
+  local current
+  current="$(as_root cat "$caddyfile" 2>/dev/null || true)"
+  # Someone else's site for this name: never touch it.
+  local others
+  others="$(awk -v b="$begin" -v e="$end" '$0==b{skip=1} !skip{print} $0==e{skip=0}' <<<"$current")"
+  if grep -qE "^[[:space:]]*(https?://)?${host//./\\.}(:443)?[[:space:]]*(,|\{)" <<<"$others"; then
+    echo "Error: $caddyfile already has a site for $host that hermes-spawn did not add." >&2
+    echo "       Point it at 127.0.0.1:${INSTANCE_GW_HOST_PORT}, or choose another address." >&2
+    return 1
+  fi
+
+  local block
+  block="$(cat <<EOF
+$begin
+$host {
+    reverse_proxy 127.0.0.1:${INSTANCE_GW_HOST_PORT} {
+        # Replies and calls stream; keep long answers open.
+        flush_interval -1
+        transport http {
+            read_timeout 1h
+            write_timeout 1h
+        }
+    }
+}
+$end
+EOF
+)"
+  as_root cp -p "$caddyfile" "${caddyfile}.bak-connect-$(date -u +%Y%m%dT%H%M%SZ)"
+  printf '%s\n\n%s\n' "$others" "$block" | as_root tee "${caddyfile}.hermes-spawn.new" >/dev/null
+  if ! as_root caddy validate --config "${caddyfile}.hermes-spawn.new" --adapter caddyfile >/tmp/hermes-spawn-caddy.$$ 2>&1; then
+    tail -n 5 /tmp/hermes-spawn-caddy.$$ >&2
+    rm -f /tmp/hermes-spawn-caddy.$$
+    as_root rm -f "${caddyfile}.hermes-spawn.new"
+    echo "Error: the new Caddy config did not validate; nothing was changed." >&2
+    return 1
+  fi
+  rm -f /tmp/hermes-spawn-caddy.$$
+  as_root sh -c "cat '${caddyfile}.hermes-spawn.new' > '$caddyfile' && rm -f '${caddyfile}.hermes-spawn.new'"
+  as_root systemctl reload caddy 2>/dev/null || as_root caddy reload --config "$caddyfile" --adapter caddyfile
+  CONNECT_URL="https://$host"
+  connect_state_save "$n" "METHOD=caddy" "URL=$CONNECT_URL" "HOST=$host"
+}
+
+# Cloudflare Tunnel: no open ports. One browser login picks the domain; the
+# tunnel and its DNS name are created here, and cloudflared runs in Docker.
+connect_cloudflare() {
+  local n="$1" host="${2-}" dir="$HOME/hermes-spawn/.cloudflared"
+  local tunnel="hermes-spawn-$n" cf_home="/home/nonroot/.cloudflared"
+  if [[ -z "$host" ]]; then
+    if [[ ! -t 0 ]]; then
+      echo "Error: --cloudflare needs --domain <name> when not run interactively." >&2
+      return 1
+    fi
+    echo
+    echo "   Your domain must use Cloudflare for DNS. Pick a name one level under it,"
+    echo "   e.g. hermes.example.com (Cloudflare's free certificate covers one level)."
+    read -r -p "   Name for Hermes: " host || true
+  fi
+  host="${host,,}"; host="${host#https://}"; host="${host%%/*}"
+  if [[ -z "$host" || "$host" != *.* ]]; then
+    echo "Error: enter a full name like hermes.example.com." >&2
+    return 1
+  fi
+  mkdir -p "$dir"
+  as_root chown 65532:65532 "$dir"
+  as_root chmod 700 "$dir"
+  local cf=(docker run --rm -v "$dir:$cf_home" "$CLOUDFLARED_IMAGE")
+  if ! as_root test -f "$dir/cert.pem"; then
+    echo ">> Log in to Cloudflare: open the link below and choose your domain."
+    docker run -it --rm -v "$dir:$cf_home" "$CLOUDFLARED_IMAGE" tunnel login || return 1
+  fi
+  local id
+  id="$("${cf[@]}" tunnel list --name "$tunnel" --output json 2>/dev/null | grep -oE '"id": *"[0-9a-f-]{36}"' | head -n1 | grep -oE '[0-9a-f-]{36}' || true)"
+  if [[ -z "$id" ]]; then
+    id="$("${cf[@]}" tunnel create "$tunnel" 2>&1 | grep -oE '[0-9a-f]{8}-[0-9a-f-]{27}' | head -n1 || true)"
+    if [[ -z "$id" ]]; then
+      echo "Error: could not create the Cloudflare tunnel '$tunnel'." >&2
+      return 1
+    fi
+  fi
+  if ! "${cf[@]}" tunnel route dns --overwrite-dns "$id" "$host" >/tmp/hermes-spawn-cf.$$ 2>&1; then
+    tail -n 3 /tmp/hermes-spawn-cf.$$ >&2
+    rm -f /tmp/hermes-spawn-cf.$$
+    echo "Error: could not point $host at the tunnel." >&2
+    return 1
+  fi
+  rm -f /tmp/hermes-spawn-cf.$$
+  docker rm -f "${n}-tunnel" >/dev/null 2>&1 || true
+  docker run -d --name "${n}-tunnel" --restart unless-stopped --network host \
+    -v "$dir:$cf_home" "$CLOUDFLARED_IMAGE" \
+    tunnel --no-autoupdate run --url "http://127.0.0.1:${INSTANCE_GW_HOST_PORT}" \
+    --credentials-file "$cf_home/$id.json" "$id" >/dev/null
+  CONNECT_URL="https://$host"
+  connect_state_save "$n" "METHOD=cloudflare" "URL=$CONNECT_URL" "HOST=$host" "TUNNEL=$id"
+}
+
+# Tailscale: private. Hermes gets an HTTPS name on the person's tailnet; the
+# phone joins the same tailnet.
+connect_tailscale() {
+  local n="$1"
+  if ! command -v tailscale &>/dev/null; then
+    echo ">> Tailscale is not installed."
+    if [[ -t 0 ]] && [[ -z "${CONNECT_YES-}" ]]; then
+      read -r -p "   Install it now (official installer from tailscale.com)? [Y/n] " ans || true
+      [[ "$ans" =~ ^[nN] ]] && return 1
+    fi
+    curl -fsSL https://tailscale.com/install.sh | as_root sh
+  fi
+  if ! tailscale status >/dev/null 2>&1; then
+    echo ">> Log in to Tailscale: open the link below."
+    as_root tailscale up || return 1
+  fi
+  # 443 for the first instance; another instance already using it gets 8443.
+  local https_port=443 other
+  for other in "$CONNECT_STATE_DIR"/*; do
+    [[ -f "$other" && "$(basename "$other")" != "$n" ]] || continue
+    if [[ "$(env_file_get "$other" METHOD)" == tailscale && "$(env_file_get "$other" TS_PORT)" == 443 ]]; then
+      https_port=8443
+    fi
+  done
+  if ! as_root tailscale serve --bg --https="$https_port" "http://127.0.0.1:${INSTANCE_GW_HOST_PORT}" >/tmp/hermes-spawn-ts.$$ 2>&1; then
+    cat /tmp/hermes-spawn-ts.$$ >&2
+    rm -f /tmp/hermes-spawn-ts.$$
+    echo "Error: tailscale serve failed. If it mentions HTTPS certificates, turn them on" >&2
+    echo "       at https://login.tailscale.com/admin/dns, then re-run." >&2
+    return 1
+  fi
+  rm -f /tmp/hermes-spawn-ts.$$
+  local dns
+  dns="$(tailscale status --json 2>/dev/null | instance_python "$n" -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true)"
+  if [[ -z "$dns" ]]; then
+    echo "Error: could not read this machine's Tailscale name." >&2
+    return 1
+  fi
+  CONNECT_URL="https://$dns"
+  [[ "$https_port" != 443 ]] && CONNECT_URL="$CONNECT_URL:$https_port"
+  connect_state_save "$n" "METHOD=tailscale" "URL=$CONNECT_URL" "TS_PORT=$https_port"
+}
+
+# --- the QR code --------------------------------------------------------------
+
+# Prints a QR code Hermsy scans: hermsy://connect?url=...&key=...
+# Drawn black on white with explicit colours, so it scans on light and dark
+# terminals alike (two rows of the code per line of text).
+connect_print_qr() {
+  local n="$1" url="$2" key="$3" colour=0
+  [[ -t 1 ]] && colour=1
+  printf '%s\n%s\n%s\n' "$url" "$key" "$colour" | instance_python "$n" -c '
+import sys, urllib.parse, qrcode
+url, key, colour = sys.stdin.read().split("\n")[:3]
+link = "hermsy://connect?" + urllib.parse.urlencode({"url": url, "key": key})
+code = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_L)
+code.add_data(link)
+code.make(fit=True)
+rows = code.get_matrix()
+if len(rows) % 2:
+    rows.append([False] * len(rows[0]))
+glyph = {(True, True): "\u2588", (True, False): "\u2580", (False, True): "\u2584", (False, False): " "}
+start, end = ("\033[30;47m", "\033[0m") if colour == "1" else ("", "")
+for top, bottom in zip(rows[0::2], rows[1::2]):
+    if colour == "1":
+        line = "".join(glyph[(t, b)] for t, b in zip(top, bottom))
+    else:
+        # Without a terminal: the light-on-dark form most terminals show.
+        line = "".join(glyph[(not t, not b)] for t, b in zip(top, bottom))
+    sys.stdout.write("  " + start + line + end + "\n")
+' 2>/dev/null || echo "   (could not draw the QR code; enter the address and key in Hermsy instead)"
+}
+
+# --- status and off -----------------------------------------------------------
+
+connect_status() {
+  local n="$1" envf="$INSTANCE_DATA_MOUNT/.env" base="http://127.0.0.1:${INSTANCE_GW_HOST_PORT}"
+  local key method url hello
+  key="$(env_file_get "$envf" API_SERVER_KEY)"
+  method="$(connect_state_get "$n" METHOD)"
+  url="$(connect_state_get "$n" URL)"
+  echo ">> '$n' and the Hermsy app"
+  if env_truthy "$(env_file_get "$envf" API_SERVER_ENABLED)"; then
+    echo "   API server : on (127.0.0.1:${INSTANCE_GW_HOST_PORT})"
+  else
+    echo "   API server : off"
+  fi
+  hello="$(plugin_hello "$base" "$key")"
+  if [[ "$hello" == *'"plugin": "hermsy"'* ]]; then
+    echo "   Plugin     : hermsy $(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' <<<"$hello")"
+  else
+    echo "   Plugin     : not answering (key from a secret manager, or not installed)"
+  fi
+  if [[ -n "$method" ]]; then
+    local code
+    code="$(gateway_status_code "$url/health")"
+    echo "   Address    : $url ($method) — $( [[ "$code" == 200 ]] && echo reachable || echo "not reachable (HTTP $code)")"
+  else
+    echo "   Address    : none yet"
+  fi
+}
+
+connect_off() {
+  local n="$1" method
+  method="$(connect_state_get "$n" METHOD)"
+  case "$method" in
+  caddy)
+    local caddyfile="/etc/caddy/Caddyfile" begin="# hermes-spawn connect: $n" end="# end hermes-spawn connect: $n"
+    as_root cp -p "$caddyfile" "${caddyfile}.bak-connect-$(date -u +%Y%m%dT%H%M%SZ)"
+    as_root cat "$caddyfile" | awk -v b="$begin" -v e="$end" '$0==b{skip=1} !skip{print} $0==e{skip=0}' | as_root tee "${caddyfile}.hermes-spawn.new" >/dev/null
+    as_root caddy validate --config "${caddyfile}.hermes-spawn.new" --adapter caddyfile >/dev/null 2>&1 || {
+      as_root rm -f "${caddyfile}.hermes-spawn.new"
+      echo "Error: Caddy config did not validate without the site; nothing was changed." >&2
+      return 1
+    }
+    as_root sh -c "cat '${caddyfile}.hermes-spawn.new' > '$caddyfile' && rm -f '${caddyfile}.hermes-spawn.new'"
+    as_root systemctl reload caddy 2>/dev/null || as_root caddy reload --config "$caddyfile" --adapter caddyfile
+    ;;
+  cloudflare)
+    docker rm -f "${n}-tunnel" >/dev/null 2>&1 || true
+    echo "   (the tunnel stays in your Cloudflare account; delete it there if you no longer need it)"
+    ;;
+  tailscale)
+    as_root tailscale serve --https="$(connect_state_get "$n" TS_PORT)" off >/dev/null 2>&1 || true
+    ;;
+  "")
+    echo ">> '$n' has no address set up by hermes-spawn. Nothing to do."
+    return 0
+    ;;
+  esac
+  rm -f "$CONNECT_STATE_DIR/$n"
+  echo ">> '$n' is no longer reachable from outside. The API server and plugin stay on."
+}
+
+# --- the command --------------------------------------------------------------
+
+sub_connect() {
+  local n="${2-}"
+  local method="" domain="" want_status=0 want_off=0 show_key=0
+  shift 2 || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --caddy)      method=caddy ;;
+    --cloudflare) method=cloudflare ;;
+    --tailscale)  method=tailscale ;;
+    --domain)
+      [[ $# -ge 2 ]] || { echo "Error: --domain needs a value." >&2; return 1; }
+      domain="$2"; shift ;;
+    --status)     want_status=1 ;;
+    --off)        want_off=1 ;;
+    --show-key)   show_key=1 ;;
+    -y | --yes)   CONNECT_YES=1 ;;
+    *) echo "Error: $0 connect: unknown option: $1" >&2; return 1 ;;
+    esac
+    shift
+  done
+  if ! [[ "$n" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "Error: name must be lowercase letters, numbers, or hyphens (and start with a letter/number)." >&2
+    return 1
+  fi
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$n"; then
+    echo "Error: no running container named '$n'. Start it, or spawn one:  $0 $n" >&2
+    return 1
+  fi
+  load_gateway_instance "$n" || return 1
+  local base="http://127.0.0.1:${INSTANCE_GW_HOST_PORT}"
+
+  if ((want_status)); then connect_status "$n"; return $?; fi
+  if ((want_off)); then connect_off "$n"; return $?; fi
+
+  echo ">> Connecting '$n' to the Hermsy phone app"
+  CONNECT_CHANGED=0
+  connect_api_server "$n" || return 1
+  connect_plugin "$n" || return 1
+  if ((CONNECT_CHANGED)); then
+    echo ">> Restarting '$n' to apply..."
+    docker restart "$n" >/dev/null
+  fi
+  if ! wait_for_health "$base"; then
+    echo "Error: '$n' did not come back on $base. See:  docker logs --tail 50 $n" >&2
+    return 1
+  fi
+
+  # The key Hermes actually uses: a secret manager (Bitwarden etc.) may
+  # override the one in .env.
+  if [[ "$(gateway_status_code "$base/v1/models" "$CONNECT_KEY")" != 200 ]]; then
+    echo "   Hermes takes its API key from somewhere else (a secret manager), not from .env."
+    if [[ -t 0 ]]; then
+      read -r -s -p "   Paste that key to put it in the QR code (or press Enter to type it in Hermsy yourself): " CONNECT_KEY || true
+      echo
+    else
+      CONNECT_KEY=""
+    fi
+    if [[ -n "$CONNECT_KEY" && "$(gateway_status_code "$base/v1/models" "$CONNECT_KEY")" != 200 ]]; then
+      echo "Error: Hermes rejected that key." >&2
+      return 1
+    fi
+  fi
+  echo "   API server ... on"
+  if [[ -n "$CONNECT_KEY" ]]; then
+    local hello
+    hello="$(plugin_hello "$base" "$CONNECT_KEY")"
+    if [[ "$hello" != *'"plugin": "hermsy"'* ]]; then
+      echo "Error: the Hermsy plugin is installed but not answering. See:  docker logs --tail 50 $n" >&2
+      echo "       (it needs Hermes 0.19 or newer:  $0 update $n)" >&2
+      return 1
+    fi
+    echo "   Plugin ....... hermsy $(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' <<<"$hello")"
+  fi
+
+  # An address the phone can reach over HTTPS: keep a working one.
+  CONNECT_URL="$(connect_state_get "$n" URL)"
+  if [[ -n "$CONNECT_URL" && -z "$method" && "$(gateway_status_code "$CONNECT_URL/health")" == 200 ]]; then
+    echo "   Address ...... $CONNECT_URL ($(connect_state_get "$n" METHOD), already set up)"
+  else
+    if [[ -z "$method" ]]; then
+      local ip suggest=tailscale owner80 owner443
+      ip="$(local_ipv4)"
+      owner80="$(port_owner 80)"; owner443="$(port_owner 443)"
+      if ipv4_is_public "$ip" && [[ -z "$owner80" || "$owner80" == caddy ]] && [[ -z "$owner443" || "$owner443" == caddy ]]; then
+        suggest=caddy
+      fi
+      if [[ ! -t 0 ]]; then
+        method="$suggest"
+      else
+        echo
+        echo "   How should your phone reach Hermes?"
+        echo "     1) A web address, with Caddy   — this server has a public IP; no domain needed"
+        echo "     2) Cloudflare Tunnel           — no open ports; your domain is on Cloudflare"
+        echo "     3) Tailscale                   — private; your phone joins your Tailscale"
+        local def=1 choice
+        [[ "$suggest" == tailscale ]] && def=3
+        read -r -p "   Choose [${def}]: " choice || true
+        case "${choice:-$def}" in
+        1) method=caddy ;; 2) method=cloudflare ;; 3) method=tailscale ;;
+        *) echo "Error: choose 1, 2 or 3." >&2; return 1 ;;
+        esac
+      fi
+    fi
+    if [[ "$method" != tailscale ]]; then
+      echo
+      echo "   Note: Hermes will be reachable from the internet, guarded by its API key"
+      echo "   (64 random characters). Anyone with the key can use your agent; keep it private."
+    fi
+    case "$method" in
+    caddy)      connect_caddy "$n" "$domain" || return 1 ;;
+    cloudflare) connect_cloudflare "$n" "$domain" || return 1 ;;
+    tailscale)  connect_tailscale "$n" || return 1 ;;
+    esac
+    echo ">> Checking $CONNECT_URL ..."
+    local i code=000
+    for ((i = 0; i < 45; i++)); do
+      code="$(gateway_status_code "$CONNECT_URL/health")"
+      [[ "$code" == 200 ]] && break
+      sleep 2
+    done
+    if [[ "$code" != 200 ]]; then
+      echo "Error: $CONNECT_URL is not answering yet (HTTP $code)." >&2
+      echo "       Certificates can take a minute; check again with:  $0 connect $n --status" >&2
+      return 1
+    fi
+    echo "   Address ...... $CONNECT_URL"
+  fi
+  if [[ -n "$CONNECT_KEY" && "$(plugin_hello "$CONNECT_URL" "$CONNECT_KEY")" != *'"plugin": "hermsy"'* ]]; then
+    echo "Error: $CONNECT_URL answers, but not with the Hermsy plugin. Is it pointing at '$n'?" >&2
+    return 1
+  fi
+
+  echo
+  echo "✓ '$n' is ready for Hermsy."
+  echo
+  if [[ -n "$CONNECT_KEY" ]]; then
+    echo "  In Hermsy, tap \"Scan QR code\" (first screen, or Settings › Hermes) and scan:"
+    echo
+    connect_print_qr "$n" "$CONNECT_URL" "$CONNECT_KEY"
+    echo
+    echo "  Or type it in:  Server URL  $CONNECT_URL"
+    if ((show_key)); then
+      echo "                  API key     $CONNECT_KEY"
+    else
+      echo "                  API key     (run  $0 connect $n --show-key  to print it)"
+    fi
+  else
+    echo "  In Hermsy, enter:  Server URL  $CONNECT_URL"
+    echo "                     API key     the key from your secret manager"
+  fi
+  if [[ "$(connect_state_get "$n" METHOD)" == tailscale ]]; then
+    echo
+    echo "  Your phone needs Tailscale too, signed in to the same account."
+  fi
+  cat <<EOF
+
+  Then, in Hermsy › Settings › Hermes, tap Set up for the Brief and the Chief of Staff.
+
+  $0 connect $n --status   # check it
+  $0 connect $n --off      # stop sharing it
+
+EOF
+}
+
+# =========================================================================
 # Subcommand routing
 # =========================================================================
 
@@ -1052,6 +1721,15 @@ if [[ ${1-} == update ]]; then
     usage_spawn
   fi
   sub_update "$@"
+  exit $?
+fi
+
+if [[ ${1-} == connect ]]; then
+  if [[ $# -lt 2 ]]; then
+    echo "Error: $0 connect: missing <name>." >&2
+    usage_spawn
+  fi
+  sub_connect "$@"
   exit $?
 fi
 
@@ -1104,7 +1782,7 @@ fi
 
 # --- 2b. reserved names ---------------------------------------------------
 RESERVED_NAMES=(
-  remove rm update restore dashboard
+  remove rm update restore dashboard connect
   ls cd cp mv mkdir rmdir cat grep sed awk find sudo su
   bash sh zsh fish docker apt yum dnf systemctl service
   git python python3 node npm pip curl wget ssh scp
@@ -1264,9 +1942,21 @@ Docker commands:
   docker start $NAME      # start it again
   $0 restore $NAME        # recreate container from existing data (no setup)
   $0 dashboard $NAME      # enable web dashboard + browser chat tab
+  $0 connect $NAME        # use it from your phone (Hermsy)
   $0 update $NAME         # pull latest image and recreate container
   $0 remove $NAME         # stop container, remove data + alias
 
 EOF
+
+# --- 4b. offer the phone app ----------------------------------------------
+if [[ -t 0 ]]; then
+  read -r -p "Set up the Hermsy phone app for '$NAME' now? [Y/n] " ans || true
+  if [[ ! "$ans" =~ ^[nN] ]]; then
+    echo
+    sub_connect connect "$NAME"
+    exit $?
+  fi
+  echo ">> Later:  $0 connect $NAME"
+fi
 
 exit 0

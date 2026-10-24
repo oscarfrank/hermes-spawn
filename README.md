@@ -6,6 +6,7 @@ Spin up named [Hermes Agent](https://hermes-agent.nousresearch.com) instances in
 hermes-spawn <name>                 # create a new instance
 hermes-spawn restore <name>         # recreate container from existing data
 hermes-spawn dashboard <name>       # enable web dashboard (+ browser Chat tab)
+hermes-spawn connect <name>         # use it from your phone (Hermsy): one command, one scan
 hermes-spawn update <name>          # pull latest image and recreate container
 hermes-spawn remove <name>          # tear down instance (container, alias, data)
 ```
@@ -64,7 +65,52 @@ hermes-spawn dashboard <name>
 
 Example: `hermes-spawn dashboard hermes` — prompts for a dashboard username/password, then opens a browser UI at `http://127.0.0.1:<port>` (dashboard port starts at 9119). The Chat tab is on by default. See [Managing instances](#managing-instances) for `--no-tui`, `--oauth`, `--disable`, and remote access.
 
+**5. (Optional) Use it from your phone:**
+
+```bash
+hermes-spawn connect <name>
+```
+
+Sets everything up for [Hermsy](#use-it-from-your-phone-hermsy), the phone app for Hermes, and ends with a QR code to scan. A new instance offers this at the end of `hermes-spawn <name>`.
+
 That's it.
+
+## Use it from your phone (Hermsy)
+
+[Hermsy](https://play.google.com/store/apps/details?id=com.illbytes.hermsy_app) is a phone app for your Hermes: chat, voice calls, an Inbox for what Hermes sends on its own, and a daily Brief. To use it, your phone needs to reach Hermes over HTTPS. `connect` does all of it:
+
+```bash
+hermes-spawn connect hermes
+```
+
+1. **Switches on Hermes's API server**, with a strong random key (an existing key is kept).
+2. **Installs the [Hermsy plugin](https://github.com/illBytes/hermsy-hermes)** and restarts the instance.
+3. **Gives Hermes an HTTPS address** your phone can reach. It suggests the right way for your machine; press Enter to accept:
+
+   | | Best for | You do |
+   |---|---|---|
+   | **Caddy** | A server with a public IP (most VPSs) | Nothing: an automatic address like `https://203-0-113-5.sslip.io`. Or type your own domain and add one DNS record. |
+   | **Cloudflare Tunnel** | A machine at home; no open ports | Click one login link (your domain must be on Cloudflare). |
+   | **Tailscale** | Keeping Hermes private | Click one login link; install Tailscale on your phone. |
+
+   Caddy and Tailscale are installed if missing (after asking). An existing Caddyfile gets one marked site, after a backup, and is validated before reloading. `connect` stops rather than taking over ports used by another web server.
+4. **Checks it end to end**: the address answers over HTTPS, and the plugin answers with your key.
+5. **Prints a QR code.** In Hermsy, tap **Scan QR code** (on the first screen, or Settings › Hermes) and point the phone at it. Hermsy fills in the address and key, checks them, and connects.
+
+Push notifications need nothing on your side: the plugin calls out to Hermsy's push service, so there is no extra port or DNS record for them.
+
+```bash
+hermes-spawn connect hermes --status      # API server, plugin, address: is it all working?
+hermes-spawn connect hermes --show-key    # print the key too, to type it in by hand
+hermes-spawn connect hermes --off         # stop sharing it (removes the Caddy site / tunnel / Tailscale serve)
+hermes-spawn connect hermes --caddy --domain hermes.example.com   # skip the questions
+```
+
+Running `connect` again is safe: it keeps what already works and fixes what doesn't.
+
+> **Security.** With Caddy or Cloudflare, your agent is reachable from the internet, guarded by its API key (64 random characters). Anyone with the key can use your agent, so keep the QR code and key private. With Tailscale, nothing is public at all.
+>
+> If your Hermes takes its key from a secret manager (Bitwarden etc.) rather than `.env`, `connect` notices and asks you to paste it for the QR code, or you type it in Hermsy yourself.
 
 ## Multiple instances
 
@@ -79,7 +125,7 @@ source ~/.bashrc          # one source picks up all new aliases
 
 Then `assistant`, `support`, and `research` are all separate commands.
 
-Ports are auto-assigned starting at 8642 (gateway) and 9119 (dashboard, when enabled), bound to `127.0.0.1` only.
+Ports are auto-assigned starting at 8642 (gateway) and 9119 (dashboard, when enabled), bound to `127.0.0.1` only. `connect` works per instance; with Tailscale, the second instance gets port 8443 on your tailnet name.
 
 ## Prerequisites
 
@@ -91,7 +137,7 @@ Ports are auto-assigned starting at 8642 (gateway) and 9119 (dashboard, when ena
 
 - Lowercase letters, numbers, and hyphens only
 - Must start with a letter or number
-- Cannot match a reserved name — including `hermes-spawn` subcommands (`restore`, `dashboard`, `update`, `remove`, `rm`) and common system commands (`ls`, `docker`, `git`, etc.)
+- Cannot match a reserved name — including `hermes-spawn` subcommands (`restore`, `dashboard`, `connect`, `update`, `remove`, `rm`) and common system commands (`ls`, `docker`, `git`, etc.)
 - Cannot collide with an existing Docker container, data directory, alias, or binary on PATH
 
 If any conflict is detected, the script aborts cleanly without changing anything. You cannot spawn an instance named `dashboard` or `restore` — those words are subcommands (e.g. `hermes-spawn restore hermes`). The same applies to `update`, `remove`, and `rm`.
@@ -176,7 +222,7 @@ sudo chmod +x /usr/local/bin/hermes-spawn
 
 ## Security notes
 
-- **Gateway ports are bound to `127.0.0.1` by default.** They are not reachable from the internet. To access remotely, use SSH tunneling, Tailscale, or a reverse proxy with authentication. The Hermes gateway has no built-in auth.
+- **Gateway ports are bound to `127.0.0.1` by default.** They are not reachable from the internet. `hermes-spawn connect` is the supported way to reach an instance from outside: it puts HTTPS in front (Caddy, Cloudflare Tunnel or Tailscale) and turns on the API server's key. Otherwise use SSH tunneling or a reverse proxy with authentication.
 - **The web dashboard requires login by default** (Hermes username/password provider). Current Hermes images ignore `HERMES_DASHBOARD_INSECURE=1` and fail closed on a non-loopback bind without an auth provider. Dashboard ports are still bound to `127.0.0.1` on the host; the password gate is what satisfies Hermes inside Docker. Pass `--oauth` only when you want Hermes's OAuth gate instead. The dashboard can still read/write API keys in `.env` after you sign in.
 - **Do not reuse bot tokens** across instances. Hermes has built-in token locks that will refuse to start a second gateway with the same token, but it's cleaner to use unique tokens from the start.
 - **API key budget alerts.** Customer-facing instances can rack up costs fast if abused. Set spending limits in your provider's dashboard.
@@ -210,6 +256,8 @@ sudo rm /usr/local/bin/hermes-spawn
 `hermes-spawn update <name>` pulls a new image (by default `nousresearch/hermes-agent`), reads the existing container's port mapping, data mount, dashboard settings, and env vars, recreates the gateway container, and leaves data and aliases in place.
 
 `hermes-spawn dashboard <name>` enables or disables Hermes's built-in web dashboard as a side-process in the same container (`HERMES_DASHBOARD=1`, optional `HERMES_DASHBOARD_TUI=1` for the browser Chat tab, interactive basic auth by default or `--oauth` for the OAuth gate), following the [official Docker pattern](https://hermes-agent.nousresearch.com/docs/user-guide/docker#running-the-dashboard).
+
+`hermes-spawn connect <name>` edits the instance's `.env` in place (after a backup) to switch on the API server, installs the Hermsy plugin with the instance's own `hermes plugins install`, restarts it, and adds an HTTPS route on the host: a marked block in `/etc/caddy/Caddyfile`, a `<name>-tunnel` cloudflared container, or `tailscale serve`. What it set up is remembered in `~/hermes-spawn/.connect/<name>`, so `--status` and `--off` know what to check and undo. The QR code is drawn with Python inside the instance's container, so the host needs nothing extra.
 
 Read the script — it's plain bash with no dependencies beyond Docker and standard Unix tools. <https://github.com/oscarfrank/hermes-spawn/blob/main/hermes-spawn>
 
